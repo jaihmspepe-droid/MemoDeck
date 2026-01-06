@@ -1,902 +1,852 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { initializeApp } from 'firebase/app';
+import { initializeApp } from "firebase/app";
 import { 
   getAuth, 
-  signInAnonymously, 
-  onAuthStateChanged,
-  createUserWithEmailAndPassword,
+  signInWithPopup, 
+  GoogleAuthProvider, 
   signInWithEmailAndPassword,
+  createUserWithEmailAndPassword,
   signOut,
-  GoogleAuthProvider,
-  signInWithPopup
-} from 'firebase/auth';
+  onAuthStateChanged,
+  signInAnonymously
+} from "firebase/auth";
 import { 
   getFirestore, 
   collection, 
-  doc, 
-  setDoc, 
   addDoc, 
+  getDocs, 
+  doc, 
   updateDoc, 
   deleteDoc, 
-  query, 
-  where, 
-  onSnapshot, 
-  enableIndexedDbPersistence,
-  serverTimestamp,
-  getDocs,
-  limit
-} from 'firebase/firestore';
+  getDoc,
+  setDoc,
+  query,
+  where
+} from "firebase/firestore";
 import { 
   Brain, 
   Plus, 
+  Trash2, 
+  Edit2, 
   Play, 
   Settings, 
-  folder, 
-  FolderOpen, 
-  FileText, 
-  ChevronRight, 
+  LogOut, 
   Moon, 
   Sun, 
+  Folder, 
+  FolderOpen, 
+  MoreVertical, 
+  Check, 
+  X, 
   Share2, 
   Download, 
-  Trophy, 
-  Flame, 
-  X, 
-  Check, 
-  LogOut,
+  WifiOff, 
   Image as ImageIcon,
-  MoreVertical,
-  Trash2,
-  Edit2,
-  User
+  FileText,
+  Save,
+  ChevronRight,
+  ChevronDown,
+  Star,
+  Award,
+  Zap,
+  LayoutDashboard,
+  ArrowLeft
 } from 'lucide-react';
 
 // --- CONFIGURATION FIREBASE ---
-const firebaseConfig = JSON.parse(__firebase_config);
-const app = initializeApp(firebaseConfig);
-const auth = getAuth(app);
-const db = getFirestore(app);
-const appId = typeof __app_id !== 'undefined' ? __app_id : 'memodeck-prod';
+const firebaseConfig = {
+  apiKey: "AIzaSyC2IfwOo9wEYgjq11WxTcxOSxNKUoLY8Wc",
+  authDomain: "memodeck-2ac00.firebaseapp.com",
+  projectId: "memodeck-2ac00",
+  storageBucket: "memodeck-2ac00.firebasestorage.app",
+  messagingSenderId: "1073357840018",
+  appId: "1:1073357840018:web:d20cddbdcc98b56458104b",
+  measurementId: "G-QBLMVGBTY3"
+};
 
-// Tentative d'activation du mode hors-ligne (Persistence)
+// Initialisation conditionnelle pour éviter les erreurs de rechargement
+let app, auth, db;
 try {
-  enableIndexedDbPersistence(db).catch((err) => {
-    if (err.code === 'failed-precondition') {
-      console.warn('La persistence a échoué : multiples onglets ouverts.');
-    } else if (err.code === 'unimplemented') {
-      console.warn('Le navigateur ne supporte pas la persistence.');
-    }
-  });
+  app = initializeApp(firebaseConfig);
+  auth = getAuth(app);
+  db = getFirestore(app);
 } catch (e) {
-  // Ignorer si déjà activé
+  console.error("Firebase init error (likely double init in dev):", e);
 }
 
-// --- UTILS & ALGORITHMES ---
+// --- UTILITAIRES ---
 
-// Algorithme simplifié de répétition espacée (inspiré de SM-2)
-const calculateNextReview = (previousInterval, difficulty, performance) => {
-  // performance: 0 (fail), 1 (hard), 2 (good), 3 (easy)
-  let nextInterval = 1;
-  let nextEase = difficulty; // difficulty stockée comme "easiness factor"
+// Générateur d'ID unique simple
+const generateId = () => Math.random().toString(36).substr(2, 9);
 
-  if (performance === 0) {
-    nextInterval = 0; // Revoir tout de suite/demain
+// Algorithme SRS Simplifié (Spaced Repetition)
+const calculateNextReview = (card, success) => {
+  const now = Date.now();
+  let interval = 24 * 60 * 60 * 1000; // 1 jour par défaut
+  
+  // Facteurs
+  const priorityFactor = card.priority === 'high' ? 0.8 : (card.priority === 'low' ? 1.2 : 1);
+  const difficultyFactor = (6 - (card.difficulty || 3)) / 3; // 1(dur)=1.66, 5(facile)=0.33 -> inversé car 5 = difficile dans prompt
+  // Prompt: 1=facile, 5=difficile. 
+  // Donc : Si 5 (difficile), on veut revoir bientot. Si 1 (facile), plus tard.
+  const promptDifficultyMod = card.difficulty ? (card.difficulty * 0.5) : 1; 
+
+  if (success) {
+    // Si réussi, on augmente l'intervalle
+    // Formule : Base * (Streak actuel + 1) * (Inverse de la difficulté)
+    const currentStreak = card.streak || 0;
+    interval = interval * (currentStreak + 1) * 2;
+    if (card.difficulty > 3) interval = interval * 0.5; // Si dur, revient un peu plus vite
   } else {
-    if (previousInterval === 0) {
-      nextInterval = 1;
-    } else if (previousInterval === 1) {
-      nextInterval = 6;
-    } else {
-      nextInterval = Math.round(previousInterval * nextEase);
-    }
+    // Si raté, revient très vite (10 minutes)
+    interval = 10 * 60 * 1000;
   }
 
-  // Ajustement de la difficulté
-  nextEase = nextEase + (0.1 - (3 - performance) * (0.08 + (3 - performance) * 0.02));
-  if (nextEase < 1.3) nextEase = 1.3;
+  return now + interval;
+};
 
-  const nextDate = new Date();
-  nextDate.setDate(nextDate.getDate() + nextInterval);
+// --- COMPOSANTS UI ---
+
+const Button = ({ children, onClick, variant = 'primary', className = '', ...props }) => {
+  const baseStyle = "px-4 py-2 rounded-lg font-medium transition-all duration-200 flex items-center justify-center gap-2 transform active:scale-95";
+  const variants = {
+    primary: "bg-[var(--primary)] text-white hover:opacity-90 shadow-lg shadow-[var(--primary)]/30",
+    secondary: "bg-gray-200 dark:bg-gray-700 text-gray-800 dark:text-white hover:bg-gray-300 dark:hover:bg-gray-600",
+    danger: "bg-red-500 text-white hover:bg-red-600 shadow-lg shadow-red-500/30",
+    ghost: "bg-transparent text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800",
+    success: "bg-green-500 text-white hover:bg-green-600 shadow-lg shadow-green-500/30"
+  };
+
+  return (
+    <button className={`${baseStyle} ${variants[variant]} ${className}`} onClick={onClick} {...props}>
+      {children}
+    </button>
+  );
+};
+
+const Input = ({ label, ...props }) => (
+  <div className="flex flex-col gap-1 mb-3">
+    {label && <label className="text-sm font-semibold text-gray-600 dark:text-gray-300">{label}</label>}
+    <input 
+      className="px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-900 dark:text-white focus:ring-2 focus:ring-[var(--primary)] outline-none transition-colors"
+      {...props}
+    />
+  </div>
+);
+
+const Card = ({ children, className = '' }) => (
+  <div className={`bg-white dark:bg-gray-900 rounded-xl shadow-xl border border-gray-100 dark:border-gray-800 ${className}`}>
+    {children}
+  </div>
+);
+
+// --- COMPOSANTS FONCTIONNELS ---
+
+// 1. GESTION DES CATÉGORIES RÉCURSIVES
+const CategoryTree = ({ category, onAddSub, onAddCard, onEdit, onDelete, depth = 0 }) => {
+  const [isOpen, setIsOpen] = useState(depth < 2); // Ouvre les 2 premiers niveaux par défaut
   
-  return { nextReview: nextDate, interval: nextInterval, ease: nextEase };
+  return (
+    <div className="ml-4 border-l-2 border-gray-200 dark:border-gray-700 pl-2 mt-2">
+      <div className="flex items-center justify-between group py-1">
+        <div 
+          className="flex items-center gap-2 cursor-pointer hover:text-[var(--primary)] transition-colors"
+          onClick={() => setIsOpen(!isOpen)}
+        >
+          {category.subCategories?.length > 0 ? (
+            isOpen ? <ChevronDown size={16} /> : <ChevronRight size={16} />
+          ) : <div className="w-4" />}
+          
+          <Folder size={18} className="text-[var(--primary)]" />
+          <span className="font-medium text-gray-700 dark:text-gray-200">{category.name}</span>
+          <span className="text-xs text-gray-400">({category.cards?.length || 0} cartes)</span>
+        </div>
+
+        <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+          <button onClick={() => onAddSub(category.id)} title="Ajouter sous-catégorie" className="p-1 hover:bg-gray-100 dark:hover:bg-gray-800 rounded"><FolderOpen size={14} /></button>
+          <button onClick={() => onAddCard(category.id)} title="Ajouter carte" className="p-1 hover:bg-gray-100 dark:hover:bg-gray-800 rounded"><Plus size={14} /></button>
+          <button onClick={() => onEdit(category)} title="Modifier" className="p-1 hover:bg-gray-100 dark:hover:bg-gray-800 rounded"><Edit2 size={14} /></button>
+          <button onClick={() => onDelete(category.id)} title="Supprimer" className="p-1 hover:bg-red-100 text-red-500 rounded"><Trash2 size={14} /></button>
+        </div>
+      </div>
+
+      {isOpen && (
+        <div>
+          {category.cards?.map(card => (
+            <div key={card.id} className="ml-6 py-1 text-sm text-gray-500 flex items-center justify-between group/card border-b border-gray-50 dark:border-gray-800">
+              <span className="truncate max-w-[200px]">{card.question}</span>
+              <div className="flex gap-1 opacity-0 group-hover/card:opacity-100">
+                <span className="text-xs font-bold text-[var(--primary)] mr-2">Diff: {card.difficulty}</span>
+                <button onClick={() => onEdit(category, card)}><Edit2 size={12} /></button>
+                <button onClick={() => onDelete(category.id, card.id)} className="text-red-500"><Trash2 size={12} /></button>
+              </div>
+            </div>
+          ))}
+          {category.subCategories?.map(sub => (
+            <CategoryTree 
+              key={sub.id} 
+              category={sub} 
+              onAddSub={onAddSub}
+              onAddCard={onAddCard}
+              onEdit={onEdit}
+              onDelete={onDelete}
+              depth={depth + 1}
+            />
+          ))}
+        </div>
+      )}
+    </div>
+  );
 };
 
-const hexToRgb = (hex) => {
-  const result = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
-  return result ? `${parseInt(result[1], 16)}, ${parseInt(result[2], 16)}, ${parseInt(result[3], 16)}` : '59, 130, 246';
-};
-
-// --- COMPOSANTS PRINCIPAUX ---
+// --- MAIN APP ---
 
 export default function MemoDeckApp() {
+  // State Global
   const [user, setUser] = useState(null);
   const [loading, setLoading] = useState(true);
-  const [theme, setTheme] = useState({ 
-    mode: 'light', 
-    primaryColor: '#3B82F6' // Bleu par défaut
-  });
+  const [view, setView] = useState('lobby'); // lobby, editor, game, profile, login
   
-  // États de navigation
-  const [view, setView] = useState('lobby'); // lobby, editor, play, settings, login
-  const [activeDeck, setActiveDeck] = useState(null);
+  // State Data
+  const [decks, setDecks] = useState([]);
+  const [currentDeck, setCurrentDeck] = useState(null);
+  const [userStats, setUserStats] = useState({ totalPoints: 0, streak: 0, multiplier: 1 });
+  
+  // State UI/Theme
+  const [themeColor, setThemeColor] = useState('#3B82F6'); // Bleu par défaut
+  const [darkMode, setDarkMode] = useState(false);
+  const [notification, setNotification] = useState(null);
 
-  // Initialisation Auth
+  // Refs
+  const gameSessionRef = useRef(null);
+
+  // --- INITIALISATION ---
+
   useEffect(() => {
-    const initAuth = async () => {
-      if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
-        await signInWithCustomToken(auth, __initial_auth_token);
+    // Theme Manager
+    const root = document.documentElement;
+    root.style.setProperty('--primary', themeColor);
+    if (darkMode) {
+      root.classList.add('dark');
+      root.style.setProperty('--bg-color', '#111827'); // gray-900
+    } else {
+      root.classList.remove('dark');
+      root.style.setProperty('--bg-color', '#F3F4F6'); // gray-100
+    }
+  }, [themeColor, darkMode]);
+
+  useEffect(() => {
+    // Auth Listener
+    const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
+      setLoading(true);
+      if (currentUser) {
+        setUser(currentUser);
+        await loadUserData(currentUser.uid);
+      } else {
+        setUser(null);
+        setDecks([]); // Clear private decks
       }
-      // On attend l'interaction utilisateur pour le login anonyme ou email
-    };
-    initAuth();
-    const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
-      setUser(currentUser);
       setLoading(false);
-      if (!currentUser) setView('login');
-      else if (view === 'login') setView('lobby');
     });
     return () => unsubscribe();
   }, []);
 
-  // Gestion du style global
-  useEffect(() => {
-    const root = document.documentElement;
-    if (theme.mode === 'dark') {
-      root.classList.add('dark');
-      root.style.setProperty('--primary-color', '#000000'); // Noir en dark mode comme demandé
-      root.style.setProperty('--primary-text', '#ffffff');
-    } else {
-      root.classList.remove('dark');
-      root.style.setProperty('--primary-color', theme.primaryColor);
-      root.style.setProperty('--primary-rgb', hexToRgb(theme.primaryColor));
-      root.style.setProperty('--primary-text', '#ffffff');
-    }
-  }, [theme]);
+  // --- LOGIQUE METIER ---
 
-  if (loading) return <div className="flex h-screen w-full items-center justify-center bg-gray-50 dark:bg-gray-900 text-gray-500">Chargement de MemoDeck...</div>;
+  const showNotification = (msg, type = 'info') => {
+    setNotification({ msg, type });
+    setTimeout(() => setNotification(null), 3000);
+  };
 
-  return (
-    <div className={`min-h-screen font-sans transition-colors duration-300 ${theme.mode === 'dark' ? 'bg-gray-900 text-white' : 'bg-gray-50 text-gray-900'}`}>
-      
-      {/* Navigation Bar */}
-      {user && view !== 'play' && (
-        <nav className="sticky top-0 z-50 backdrop-blur-md bg-white/80 dark:bg-gray-800/80 border-b border-gray-200 dark:border-gray-700">
-          <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-            <div className="flex justify-between h-16 items-center">
-              <div className="flex items-center cursor-pointer" onClick={() => setView('lobby')}>
-                <div className="w-8 h-8 rounded-lg bg-[var(--primary-color)] dark:bg-white flex items-center justify-center mr-2 shadow-lg">
-                  <Brain className="w-5 h-5 text-white dark:text-black" />
-                </div>
-                <span className="text-xl font-bold tracking-tight">MemoDeck</span>
-              </div>
-              
-              <div className="flex items-center gap-4">
-                <div className="hidden md:flex items-center gap-2 bg-gray-100 dark:bg-gray-700 px-3 py-1 rounded-full text-sm">
-                  <Flame className="w-4 h-4 text-orange-500" />
-                  <span className="font-semibold">12</span> {/* Mock Streak */}
-                </div>
-                
-                <button 
-                  onClick={() => setTheme(prev => ({ ...prev, mode: prev.mode === 'light' ? 'dark' : 'light' }))}
-                  className="p-2 rounded-full hover:bg-gray-200 dark:hover:bg-gray-700 transition-colors"
-                >
-                  {theme.mode === 'light' ? <Moon size={20} /> : <Sun size={20} />}
-                </button>
-                
-                <button 
-                  onClick={() => signOut(auth)}
-                  className="p-2 rounded-full hover:bg-gray-200 dark:hover:bg-gray-700 text-red-500"
-                  title="Déconnexion"
-                >
-                  <LogOut size={20} />
-                </button>
-              </div>
-            </div>
-          </div>
-        </nav>
-      )}
-
-      {/* Main Content Area */}
-      <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6">
-        {view === 'login' && <AuthScreen setUser={setUser} />}
-        {view === 'lobby' && <Lobby user={user} setView={setView} setActiveDeck={setActiveDeck} theme={theme} setTheme={setTheme} />}
-        {view === 'editor' && <DeckEditor user={user} deck={activeDeck} onBack={() => setView('lobby')} />}
-        {view === 'play' && <GameSession user={user} deck={activeDeck} onExit={() => setView('lobby')} theme={theme} />}
-      </main>
-    </div>
-  );
-}
-
-// --- ECRAN D'AUTHENTIFICATION ---
-function AuthScreen({ setUser }) {
-  const [isRegistering, setIsRegistering] = useState(false);
-  const [email, setEmail] = useState('');
-  const [password, setPassword] = useState('');
-  const [error, setError] = useState('');
-
-  const handleEmailAuth = async (e) => {
-    e.preventDefault();
-    setError('');
+  const loadUserData = async (uid) => {
     try {
-      if (isRegistering) {
-        await createUserWithEmailAndPassword(auth, email, password);
+      // Charger les stats
+      const statsRef = doc(db, "users", uid);
+      const statsSnap = await getDoc(statsRef);
+      if (statsSnap.exists()) {
+        const data = statsSnap.data();
+        setUserStats(data.stats || { totalPoints: 0, streak: 0, multiplier: 1 });
+        if (data.themeColor) setThemeColor(data.themeColor);
+        if (data.darkMode !== undefined) setDarkMode(data.darkMode);
       } else {
-        await signInWithEmailAndPassword(auth, email, password);
+        // Init user
+        await setDoc(statsRef, { 
+          email: user?.email || 'guest',
+          stats: { totalPoints: 0, streak: 0, multiplier: 1 } 
+        });
       }
-    } catch (err) {
-      setError(err.message);
+
+      // Charger les decks
+      const q = query(collection(db, "decks"), where("ownerId", "==", uid));
+      const querySnapshot = await getDocs(q);
+      const loadedDecks = [];
+      querySnapshot.forEach((doc) => {
+        loadedDecks.push({ id: doc.id, ...doc.data() });
+      });
+      setDecks(loadedDecks);
+    } catch (error) {
+      console.error("Error loading data:", error);
+      showNotification("Erreur de chargement", "error");
     }
   };
 
-  const handleGuest = async () => {
+  // Sauvegarde des préférences
+  const savePreferences = async () => {
+    if (!user || user.isAnonymous) return;
+    try {
+      await updateDoc(doc(db, "users", user.uid), {
+        themeColor,
+        darkMode
+      });
+    } catch (e) { console.error(e); }
+  };
+
+  // --- AUTHENTIFICATION ---
+
+  const handleGoogleLogin = async () => {
+    const provider = new GoogleAuthProvider();
+    try {
+      await signInWithPopup(auth, provider);
+      setView('lobby');
+    } catch (error) {
+      showNotification("Erreur de connexion Google", "error");
+    }
+  };
+
+  const handleGuestLogin = async () => {
     try {
       await signInAnonymously(auth);
-    } catch (err) {
-      setError("Erreur connexion invité");
+      showNotification("Mode Invité : Pas de sauvegarde cloud !", "warning");
+      setView('lobby');
+    } catch (error) {
+      showNotification("Erreur invité", "error");
     }
   };
 
-  const handleGoogle = async () => {
-      const provider = new GoogleAuthProvider();
-      try {
-          await signInWithPopup(auth, provider);
-      } catch (err) {
-          setError(err.message);
-      }
-  }
+  const handleLogout = async () => {
+    await signOut(auth);
+    setView('login');
+  };
 
-  return (
-    <div className="flex flex-col items-center justify-center min-h-[80vh] w-full max-w-md mx-auto">
-      <div className="bg-white dark:bg-gray-800 p-8 rounded-2xl shadow-xl w-full border border-gray-100 dark:border-gray-700">
-        <div className="flex justify-center mb-6">
-          <div className="w-16 h-16 rounded-2xl bg-blue-600 flex items-center justify-center shadow-lg rotate-3 hover:rotate-6 transition-transform">
-            <Brain className="w-10 h-10 text-white" />
-          </div>
-        </div>
-        <h2 className="text-3xl font-bold text-center mb-2">Bienvenue sur MemoDeck</h2>
-        <p className="text-gray-500 text-center mb-8">Maîtrisez vos connaissances.</p>
-
-        {error && <div className="bg-red-100 text-red-600 p-3 rounded-lg mb-4 text-sm">{error}</div>}
-
-        <form onSubmit={handleEmailAuth} className="space-y-4">
-          <div>
-            <label className="block text-sm font-medium mb-1">Email</label>
-            <input 
-              type="email" 
-              required
-              className="w-full px-4 py-3 rounded-lg border dark:bg-gray-700 dark:border-gray-600 focus:ring-2 focus:ring-blue-500 outline-none transition-all"
-              value={email}
-              onChange={e => setEmail(e.target.value)}
-            />
-          </div>
-          <div>
-            <label className="block text-sm font-medium mb-1">Mot de passe</label>
-            <input 
-              type="password" 
-              required
-              className="w-full px-4 py-3 rounded-lg border dark:bg-gray-700 dark:border-gray-600 focus:ring-2 focus:ring-blue-500 outline-none transition-all"
-              value={password}
-              onChange={e => setPassword(e.target.value)}
-            />
-          </div>
-          <button type="submit" className="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 rounded-xl transition-all shadow-md hover:shadow-lg active:scale-95">
-            {isRegistering ? "Créer un compte" : "Se connecter"}
-          </button>
-        </form>
-
-        <div className="my-6 flex items-center">
-          <div className="flex-1 h-px bg-gray-200 dark:bg-gray-600"></div>
-          <span className="px-4 text-gray-400 text-sm">OU</span>
-          <div className="flex-1 h-px bg-gray-200 dark:bg-gray-600"></div>
-        </div>
-
-        <button onClick={handleGoogle} className="w-full bg-white dark:bg-gray-700 border border-gray-300 dark:border-gray-600 text-gray-700 dark:text-white font-semibold py-3 rounded-xl hover:bg-gray-50 dark:hover:bg-gray-600 transition-all mb-3 flex items-center justify-center gap-2">
-            <svg className="w-5 h-5" viewBox="0 0 24 24"><path fill="currentColor" d="M21.35,11.1H12.18V13.83H18.69C18.36,17.64 15.19,19.27 12.19,19.27C8.36,19.27 5,16.25 5,12.61C5,8.96 8.36,5.97 12.19,5.97C14.38,5.97 15.68,6.89 16.47,7.65L18.66,5.46C17,3.92 14.83,3.03 12.19,3.03C6.84,3.03 2.5,7.32 2.5,12.61C2.5,17.9 6.84,22.19 12.19,22.19C17.63,22.19 21.65,18.52 21.65,12.61C21.65,11.75 21.56,11.23 21.35,11.1Z" /></svg>
-            Continuer avec Google
-        </button>
-
-        <button onClick={handleGuest} className="w-full bg-gray-100 dark:bg-gray-700 text-gray-600 dark:text-gray-300 font-semibold py-3 rounded-xl hover:bg-gray-200 dark:hover:bg-gray-600 transition-all">
-          Mode Invité (Pas de sauvegarde)
-        </button>
-        
-        <p className="mt-6 text-center text-sm text-gray-500 cursor-pointer hover:underline" onClick={() => setIsRegistering(!isRegistering)}>
-          {isRegistering ? "Déjà un compte ? Se connecter" : "Pas de compte ? S'inscrire"}
-        </p>
-      </div>
-    </div>
-  );
-}
-
-// --- LOBBY (Liste des decks) ---
-function Lobby({ user, setView, setActiveDeck, theme, setTheme }) {
-  const [decks, setDecks] = useState([]);
-  const [joinCode, setJoinCode] = useState('');
-  const [showColorPicker, setShowColorPicker] = useState(false);
-
-  useEffect(() => {
-    if (!user) return;
-    const q = query(
-      collection(db, 'artifacts', appId, 'users', user.uid, 'decks')
-    );
-    const unsubscribe = onSnapshot(q, (snapshot) => {
-      const decksData = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-      setDecks(decksData);
-    });
-    return () => unsubscribe();
-  }, [user]);
+  // --- GESTION DES DECKS ---
 
   const createDeck = async () => {
+    if (!user) return;
     const newDeck = {
-      title: 'Nouveau Deck',
-      description: 'Description du deck',
-      color: theme.primaryColor,
-      createdAt: serverTimestamp(),
-      cardCount: 0,
-      publicCode: Math.random().toString(36).substring(2, 8).toUpperCase()
+      title: "Nouveau Deck",
+      ownerId: user.uid,
+      createdAt: Date.now(),
+      rootCategory: {
+        id: generateId(),
+        name: "Racine",
+        subCategories: [],
+        cards: []
+      },
+      stats: { played: 0, lastPlayed: null },
+      shareCode: generateId().substring(0, 6).toUpperCase()
     };
-    const docRef = await addDoc(collection(db, 'artifacts', appId, 'users', user.uid, 'decks'), newDeck);
-    setActiveDeck({ id: docRef.id, ...newDeck });
-    setView('editor');
+
+    try {
+      const docRef = await addDoc(collection(db, "decks"), newDeck);
+      const deckWithId = { ...newDeck, id: docRef.id };
+      setDecks([...decks, deckWithId]);
+      setCurrentDeck(deckWithId);
+      setView('editor');
+    } catch (e) {
+      showNotification("Erreur création deck", "error");
+    }
   };
 
-  const deleteDeck = async (e, deckId) => {
-    e.stopPropagation();
-    if(confirm("Supprimer ce deck ?")) {
-        await deleteDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'decks', deckId));
+  const deleteDeck = async (deckId) => {
+    if(!confirm("Supprimer ce deck ?")) return;
+    try {
+      await deleteDoc(doc(db, "decks", deckId));
+      setDecks(decks.filter(d => d.id !== deckId));
+    } catch (e) { showNotification("Erreur suppression", "error"); }
+  };
+
+  const saveDeck = async (deckToSave) => {
+    if (!user || !deckToSave) return;
+    try {
+      // Clean undefined fields if any before saving
+      await updateDoc(doc(db, "decks", deckToSave.id), deckToSave);
+      setDecks(decks.map(d => d.id === deckToSave.id ? deckToSave : d));
+      showNotification("Deck sauvegardé !", "success");
+    } catch (e) {
+      showNotification("Erreur sauvegarde", "error");
+      console.error(e);
     }
+  };
+
+  // Fonction récursive pour trouver et mettre à jour une catégorie
+  const updateCategoryInTree = (root, targetId, updateFn) => {
+    if (root.id === targetId) return updateFn(root);
+    if (root.subCategories) {
+      root.subCategories = root.subCategories.map(sub => updateCategoryInTree(sub, targetId, updateFn));
+    }
+    return root;
+  };
+  
+  // Fonction récursive pour trouver et supprimer une catégorie ou carte
+  const deleteFromTree = (root, targetId, type = 'category') => {
+    if (type === 'category') {
+      root.subCategories = root.subCategories.filter(sub => sub.id !== targetId);
+      root.subCategories.forEach(sub => deleteFromTree(sub, targetId, type));
+    } else {
+      // Delete card
+      if (root.cards) root.cards = root.cards.filter(c => c.id !== targetId);
+      root.subCategories.forEach(sub => deleteFromTree(sub, targetId, type));
+    }
+    return root;
+  };
+
+  // --- MODE JEU (GAME LOOP) ---
+  
+  const [gameQueue, setGameQueue] = useState([]);
+  const [currentCard, setCurrentCard] = useState(null);
+  const [isFlipped, setIsFlipped] = useState(false);
+  const [sessionScore, setSessionScore] = useState(0);
+  const [gameType, setGameType] = useState('review'); // 'review' or 'play'
+
+  const startGame = (deck, mode = 'review') => {
+    // 1. Aplatir le deck pour récupérer toutes les cartes
+    const allCards = [];
+    const traverse = (cat) => {
+      if (cat.cards) cat.cards.forEach(c => allCards.push({ ...c, categoryName: cat.name }));
+      if (cat.subCategories) cat.subCategories.forEach(traverse);
+    };
+    traverse(deck.rootCategory);
+
+    if (allCards.length === 0) {
+      showNotification("Ce deck est vide !", "warning");
+      return;
+    }
+
+    // 2. Filtrer et Trier selon SRS
+    let queue = [];
+    if (mode === 'review') {
+      const now = Date.now();
+      queue = allCards.filter(c => !c.nextReview || c.nextReview <= now);
+      // Si pas de cartes à revoir, on peut proposer de réviser les "prochaines"
+      if (queue.length === 0) {
+        if(confirm("Pas de révision urgente. Réviser en avance ?")) {
+           queue = allCards.sort((a, b) => (a.nextReview || 0) - (b.nextReview || 0)).slice(0, 20);
+        } else {
+          return;
+        }
+      }
+      // Tri par priorité et difficulté
+      queue.sort((a, b) => {
+         // High priority first
+         if (a.priority === 'high' && b.priority !== 'high') return -1;
+         // Hardest first
+         return (b.difficulty || 3) - (a.difficulty || 3);
+      });
+    } else {
+      // Mode Libre (Shuffle)
+      queue = allCards.sort(() => Math.random() - 0.5);
+    }
+
+    setGameQueue(queue);
+    setSessionScore(0);
+    setGameType(mode);
+    setCurrentDeck(deck);
+    gameSessionRef.current = { correct: 0, wrong: 0, startTime: Date.now() };
+    
+    if (queue.length > 0) {
+      setCurrentCard(queue[0]);
+      setIsFlipped(false);
+      setView('game');
+    }
+  };
+
+  const handleAnswer = (known) => {
+    // 1. Calcul Score
+    let points = 0;
+    let newStreak = userStats.streak;
+    let newMultiplier = userStats.multiplier;
+
+    if (known) {
+      newStreak++;
+      if (newStreak % 5 === 0) newMultiplier = Math.min(newMultiplier + 0.5, 3); // Max x3
+      points = 10 * newMultiplier;
+      gameSessionRef.current.correct++;
+    } else {
+      newStreak = 0;
+      newMultiplier = 1;
+      points = -5;
+      gameSessionRef.current.wrong++;
+    }
+
+    // Update session score
+    setSessionScore(prev => prev + points);
+
+    // Update User Stats
+    const newUserStats = {
+      totalPoints: userStats.totalPoints + points,
+      streak: newStreak,
+      multiplier: newMultiplier
+    };
+    setUserStats(newUserStats);
+
+    // 2. SRS Update Logic (in local copy of deck)
+    const updatedCard = { 
+      ...currentCard, 
+      lastReviewed: Date.now(),
+      nextReview: calculateNextReview(currentCard, known),
+      streak: known ? (currentCard.streak || 0) + 1 : 0
+    };
+
+    // Mettre à jour la carte dans l'arbre du deck (Complexe en flat state, on simplifie pour le prototype)
+    // On met à jour le deck global en mémoire
+    const newRoot = updateCategoryInTree(
+        JSON.parse(JSON.stringify(currentDeck.rootCategory)), // Deep copy safe
+        null, // No ID needed for tree traversal, we need to find the card
+        (cat) => cat // Dummy
+    );
+    
+    // Fonction helper pour remplacer la carte dans l'arbre
+    const replaceCardInTree = (cat) => {
+      if(cat.cards) {
+        cat.cards = cat.cards.map(c => c.id === updatedCard.id ? updatedCard : c);
+      }
+      if(cat.subCategories) cat.subCategories.forEach(replaceCardInTree);
+    };
+    replaceCardInTree(newRoot);
+    
+    // Sauvegarder silencieusement
+    const updatedDeck = { ...currentDeck, rootCategory: newRoot };
+    setCurrentDeck(updatedDeck);
+    
+    // Si c'est en ligne, on push à Firebase (debounce idéalement, ici direct)
+    updateDoc(doc(db, "decks", currentDeck.id), { rootCategory: newRoot })
+      .catch(e => console.log("Auto-save failed", e));
+      
+    updateDoc(doc(db, "users", user.uid), { stats: newUserStats })
+       .catch(e => console.log("Stats save failed", e));
+
+
+    // 3. Next Card
+    const nextQueue = gameQueue.slice(1);
+    
+    // Si la réponse était fausse, on remet la carte un peu plus loin dans la session (optionnel, bon pour l'apprentissage)
+    if (!known && gameType === 'review') {
+        nextQueue.splice(3, 0, updatedCard); // Réinsère dans 3 tours
+    }
+
+    setGameQueue(nextQueue);
+    if (nextQueue.length > 0) {
+      setCurrentCard(nextQueue[0]);
+      setIsFlipped(false);
+    } else {
+      finishGame();
+    }
+  };
+
+  const finishGame = () => {
+    alert(`Session terminée !\nScore: ${sessionScore}\nCorrect: ${gameSessionRef.current.correct}\nFaux: ${gameSessionRef.current.wrong}`);
+    setView('lobby');
+  };
+
+  // --- VUES ---
+
+  // LOGIN VIEW
+  if (view === 'login') {
+    return (
+      <div className="min-h-screen bg-gray-50 dark:bg-gray-900 flex flex-col items-center justify-center p-4">
+        <div className="bg-white dark:bg-gray-800 p-8 rounded-2xl shadow-xl w-full max-w-md text-center">
+          <div className="flex justify-center mb-6">
+             {/* LOGO PLACEHOLDER */}
+             <div className="bg-[var(--primary)] p-4 rounded-xl shadow-lg transform rotate-3">
+                <Brain size={48} className="text-white" />
+             </div>
+          </div>
+          <h1 className="text-4xl font-black mb-2 text-gray-800 dark:text-white font-sans tracking-tighter">Memo<span className="text-[var(--primary)]">Deck</span></h1>
+          <p className="text-gray-500 mb-8">Maîtrisez tout, une carte à la fois.</p>
+
+          <div className="space-y-4">
+            <Button onClick={handleGoogleLogin} className="w-full justify-center !bg-white !text-gray-700 border border-gray-300 hover:!bg-gray-50">
+              <svg className="w-5 h-5" viewBox="0 0 24 24"><path fill="currentColor" d="M21.35 11.1h-9.17v2.73h6.51c-.33 3.81-3.5 5.44-6.5 5.44C8.36 19.27 5 16.25 5 12c0-4.1 3.2-7.27 7.2-7.27 3.09 0 4.9 1.97 4.9 1.97L19 4.72S14.86 2 12 2C6.48 2 2 6.48 2 12s4.48 10 10 10c5.19 0 8.76-3.78 8.76-9.19 0-.72-.08-1.31-.15-1.71z"/></svg>
+              Continuer avec Google
+            </Button>
+            
+            <div className="relative my-4">
+               <div className="absolute inset-0 flex items-center"><div className="w-full border-t border-gray-200 dark:border-gray-700"></div></div>
+               <div className="relative flex justify-center text-sm"><span className="px-2 bg-white dark:bg-gray-800 text-gray-500">Ou</span></div>
+            </div>
+
+            <Button onClick={handleGuestLogin} variant="ghost" className="w-full justify-center">
+              Mode Invité (Pas de sauvegarde)
+            </Button>
+          </div>
+        </div>
+      </div>
+    );
   }
 
-  const joinDeck = () => {
-    alert("Fonctionnalité simulée : Deck rejoint avec succès ! (Code: " + joinCode + ")");
-    setJoinCode('');
-  };
-
+  // APP LAYOUT (Lobby, Editor, Game)
   return (
-    <div className="space-y-8">
-      {/* Header & Stats Summary */}
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-        <div className="bg-gradient-to-br from-[var(--primary-color)] to-purple-600 rounded-2xl p-6 text-white shadow-lg col-span-2 relative overflow-hidden">
-          <div className="absolute top-0 right-0 w-32 h-32 bg-white opacity-10 rounded-full -mr-10 -mt-10"></div>
-          <h1 className="text-3xl font-bold mb-2">Bonjour, {user.isAnonymous ? "Invité" : user.displayName || "Apprenant"} !</h1>
-          <p className="opacity-90">Prêt pour une session de révision intelligente ?</p>
-          <div className="mt-6 flex gap-4">
-            <div className="bg-white/20 p-3 rounded-lg backdrop-blur-sm">
-              <span className="block text-2xl font-bold">85%</span>
-              <span className="text-xs opacity-75">Précision</span>
+    <div className={`min-h-screen bg-[var(--bg-color)] text-gray-900 dark:text-white font-sans transition-colors duration-300`}>
+      
+      {/* NOTIFICATION TOAST */}
+      {notification && (
+        <div className={`fixed top-4 right-4 z-50 px-6 py-3 rounded-xl shadow-2xl text-white font-medium animate-bounce 
+          ${notification.type === 'error' ? 'bg-red-500' : notification.type === 'warning' ? 'bg-orange-500' : 'bg-[var(--primary)]'}`}>
+          {notification.msg}
+        </div>
+      )}
+
+      {/* HEADER */}
+      <header className="sticky top-0 z-40 bg-white/80 dark:bg-gray-900/80 backdrop-blur-md border-b border-gray-200 dark:border-gray-800">
+        <div className="max-w-6xl mx-auto px-4 h-16 flex items-center justify-between">
+          <div className="flex items-center gap-2 cursor-pointer" onClick={() => setView('lobby')}>
+             <Brain className="text-[var(--primary)]" />
+             <span className="text-xl font-bold tracking-tight hidden sm:inline">MemoDeck</span>
+          </div>
+
+          <div className="flex items-center gap-4">
+            {/* STATS PILL */}
+            <div className="hidden md:flex items-center gap-3 bg-gray-100 dark:bg-gray-800 px-3 py-1.5 rounded-full text-sm">
+              <div className="flex items-center gap-1 text-yellow-500">
+                <Star size={14} fill="currentColor" />
+                <span className="font-bold">{userStats.totalPoints}</span>
+              </div>
+              <div className="w-px h-4 bg-gray-300 dark:bg-gray-600"></div>
+              <div className="flex items-center gap-1 text-orange-500">
+                <Zap size={14} fill="currentColor" />
+                <span className="font-bold">x{userStats.multiplier}</span>
+              </div>
             </div>
-            <div className="bg-white/20 p-3 rounded-lg backdrop-blur-sm">
-              <span className="block text-2xl font-bold">124</span>
-              <span className="text-xs opacity-75">Cartes Vues</span>
+
+            {/* ACTIONS */}
+            <div className="flex items-center gap-2">
+               <button onClick={() => {
+                 setDarkMode(!darkMode);
+                 savePreferences();
+               }} className="p-2 rounded-full hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors">
+                 {darkMode ? <Sun size={20} /> : <Moon size={20} />}
+               </button>
+               
+               <div className="h-8 w-8 rounded-full bg-gradient-to-tr from-[var(--primary)] to-purple-500 flex items-center justify-center text-white font-bold text-xs">
+                 {user?.isAnonymous ? 'G' : user?.email?.[0].toUpperCase()}
+               </div>
+               
+               <button onClick={handleLogout} className="text-gray-500 hover:text-red-500"><LogOut size={20}/></button>
             </div>
           </div>
         </div>
+      </header>
+
+      {/* CONTENT */}
+      <main className="max-w-6xl mx-auto px-4 py-8">
         
-        {/* Personnalisation Rapide */}
-        <div className="bg-white dark:bg-gray-800 rounded-2xl p-6 shadow-md border border-gray-100 dark:border-gray-700 flex flex-col justify-between">
-           <h3 className="font-semibold text-lg flex items-center gap-2">
-             <Settings className="w-5 h-5 text-gray-500" /> Personnalisation
-           </h3>
-           <div className="space-y-4 mt-4">
-             <div>
-                <label className="text-xs font-bold text-gray-400 uppercase">Couleur Principale</label>
-                <div className="flex gap-2 mt-2">
-                    {['#3B82F6', '#EF4444', '#10B981', '#F59E0B', '#8B5CF6', '#EC4899'].map(color => (
-                        <button 
-                            key={color}
-                            className={`w-8 h-8 rounded-full border-2 ${theme.primaryColor === color ? 'border-gray-900 dark:border-white scale-110' : 'border-transparent'}`}
-                            style={{ backgroundColor: color }}
-                            onClick={() => setTheme(prev => ({ ...prev, primaryColor: color }))}
-                        />
-                    ))}
-                    <div className="relative">
-                         <button className="w-8 h-8 rounded-full border border-dashed border-gray-400 flex items-center justify-center text-gray-400 hover:border-gray-600" onClick={() => setShowColorPicker(!showColorPicker)}>
-                             <Edit2 size={12} />
-                         </button>
-                         {showColorPicker && (
-                             <input 
-                                type="color" 
-                                className="absolute top-10 left-0 w-20 h-10"
-                                value={theme.primaryColor}
-                                onChange={(e) => setTheme(prev => ({...prev, primaryColor: e.target.value}))}
-                             />
-                         )}
+        {/* VUE: LOBBY */}
+        {view === 'lobby' && (
+          <div className="space-y-8">
+            <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
+              <div>
+                <h2 className="text-3xl font-bold mb-1">Mes Decks</h2>
+                <p className="text-gray-500 dark:text-gray-400">Prêt à réviser aujourd'hui ?</p>
+              </div>
+              <div className="flex gap-2 w-full md:w-auto">
+                <div className="relative flex-1 md:flex-none">
+                    <input type="text" placeholder="Entrer un code..." className="pl-3 py-2 rounded-lg border dark:bg-gray-800 dark:border-gray-700 w-full" />
+                    <button className="absolute right-2 top-2 text-[var(--primary)]"><Download size={18}/></button>
+                </div>
+                <Button onClick={createDeck}><Plus size={18} /> Créer</Button>
+              </div>
+            </div>
+
+            {/* GRID DECKS */}
+            {loading ? <p>Chargement...</p> : (
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                {decks.map(deck => (
+                  <Card key={deck.id} className="group hover:-translate-y-1 transition-transform duration-300 cursor-pointer relative overflow-hidden">
+                    <div className="absolute top-0 left-0 w-2 h-full bg-[var(--primary)]"></div>
+                    <div className="p-6">
+                      <div className="flex justify-between items-start mb-4">
+                        <h3 className="text-xl font-bold truncate pr-4">{deck.title}</h3>
+                        <div className="flex gap-1">
+                           <button onClick={(e) => { e.stopPropagation(); setCurrentDeck(deck); setView('editor'); }} className="p-2 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-full text-gray-400 hover:text-[var(--primary)]"><Edit2 size={16}/></button>
+                           <button onClick={(e) => { e.stopPropagation(); deleteDeck(deck.id); }} className="p-2 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-full text-gray-400 hover:text-red-500"><Trash2 size={16}/></button>
+                        </div>
+                      </div>
+                      
+                      <div className="flex justify-between items-end mt-8">
+                        <div className="text-sm text-gray-500">
+                           <div className="flex items-center gap-1"><Folder size={14}/> {deck.rootCategory.subCategories?.length || 0} Cats</div>
+                           <div className="flex items-center gap-1 mt-1"><FileText size={14}/> {deck.stats?.played || 0} sessions</div>
+                        </div>
+                        <Button onClick={() => startGame(deck, 'review')} className="rounded-full !px-6 shadow-xl shadow-[var(--primary)]/20">
+                           <Play size={18} fill="currentColor" /> Jouer
+                        </Button>
+                      </div>
                     </div>
+                  </Card>
+                ))}
+                
+                {decks.length === 0 && (
+                   <div className="col-span-full py-20 text-center border-2 border-dashed border-gray-300 dark:border-gray-700 rounded-xl">
+                      <p className="text-gray-500">Aucun deck pour le moment.</p>
+                      <button onClick={createDeck} className="text-[var(--primary)] font-bold mt-2 hover:underline">Créer mon premier deck</button>
+                   </div>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* VUE: EDITOR */}
+        {view === 'editor' && currentDeck && (
+          <div className="animate-fade-in">
+             <div className="flex items-center gap-4 mb-6">
+               <button onClick={() => { saveDeck(currentDeck); setView('lobby'); }} className="p-2 hover:bg-gray-200 dark:hover:bg-gray-800 rounded-full"><ArrowLeft /></button>
+               <input 
+                 value={currentDeck.title} 
+                 onChange={(e) => setCurrentDeck({...currentDeck, title: e.target.value})}
+                 className="text-3xl font-bold bg-transparent border-none focus:ring-0 w-full"
+               />
+               <Button onClick={() => saveDeck(currentDeck)} variant="success"><Save size={18} /> Sauvegarder</Button>
+             </div>
+
+             <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+                {/* TREE STRUCTURE */}
+                <div className="lg:col-span-1 bg-white dark:bg-gray-800 p-6 rounded-xl shadow-sm h-fit">
+                   <h3 className="font-bold text-gray-500 uppercase text-xs tracking-wider mb-4">Structure du Deck</h3>
+                   <CategoryTree 
+                      category={currentDeck.rootCategory}
+                      onAddSub={(parentId) => {
+                        const name = prompt("Nom de la sous-catégorie ?");
+                        if(!name) return;
+                        const newCat = { id: generateId(), name, subCategories: [], cards: [] };
+                        const newRoot = updateCategoryInTree({...currentDeck.rootCategory}, parentId, (cat) => ({
+                           ...cat, subCategories: [...(cat.subCategories||[]), newCat]
+                        }));
+                        setCurrentDeck({...currentDeck, rootCategory: newRoot});
+                      }}
+                      onAddCard={(catId) => {
+                         // Open Card Modal or simple prompt
+                         const q = prompt("Question ?");
+                         const a = prompt("Réponse ?");
+                         if(!q || !a) return;
+                         const newCard = { 
+                            id: generateId(), 
+                            question: q, 
+                            answer: a, 
+                            difficulty: 3, 
+                            priority: 'normal',
+                            type: 'classic', // or true_false
+                            createdAt: Date.now()
+                         };
+                         const newRoot = updateCategoryInTree({...currentDeck.rootCategory}, catId, (cat) => ({
+                           ...cat, cards: [...(cat.cards||[]), newCard]
+                        }));
+                        setCurrentDeck({...currentDeck, rootCategory: newRoot});
+                      }}
+                      onEdit={(item, card) => {
+                         if(card) {
+                            // Edit Card Logic (Simplified)
+                            const q = prompt("Nouvelle Question", card.question);
+                            const a = prompt("Nouvelle Réponse", card.answer);
+                            if(q) {
+                               // This needs a proper recursive update for cards, simplified here:
+                               // In a real app, use a Modal with state
+                               alert("Modification rapide non implémentée dans cette démo (Utiliser Supprimer + Ajouter)");
+                            }
+                         } else {
+                            // Edit Category
+                            const name = prompt("Renommer catégorie", item.name);
+                            if(name) {
+                               const newRoot = updateCategoryInTree({...currentDeck.rootCategory}, item.id, (cat) => ({...cat, name}));
+                               setCurrentDeck({...currentDeck, rootCategory: newRoot});
+                            }
+                         }
+                      }}
+                      onDelete={(parentId, cardId) => {
+                         if(!confirm("Supprimer ?")) return;
+                         const newRoot = deleteFromTree({...currentDeck.rootCategory}, cardId || parentId, cardId ? 'card' : 'category');
+                         setCurrentDeck({...currentDeck, rootCategory: newRoot});
+                      }}
+                   />
+                </div>
+
+                {/* PREVIEW / HELP */}
+                <div className="lg:col-span-2 bg-blue-50 dark:bg-gray-800/50 border border-blue-100 dark:border-gray-700 p-8 rounded-xl flex flex-col items-center justify-center text-center text-gray-500">
+                   <Brain size={64} className="text-blue-200 mb-4" />
+                   <h3 className="text-lg font-medium text-gray-700 dark:text-gray-300">Mode Édition</h3>
+                   <p className="max-w-md mt-2">Utilisez l'arbre à gauche pour structurer votre deck. Ajoutez des catégories infinies et insérez des cartes.</p>
+                   <div className="mt-6 flex gap-2">
+                      <span className="px-2 py-1 bg-white dark:bg-gray-900 rounded text-xs border">Question / Réponse</span>
+                      <span className="px-2 py-1 bg-white dark:bg-gray-900 rounded text-xs border">Vrai / Faux</span>
+                      <span className="px-2 py-1 bg-white dark:bg-gray-900 rounded text-xs border">Images</span>
+                   </div>
                 </div>
              </div>
-           </div>
-        </div>
-      </div>
-
-      {/* Decks Grid */}
-      <div>
-        <div className="flex justify-between items-center mb-6">
-          <h2 className="text-2xl font-bold text-gray-800 dark:text-white">Mes Decks</h2>
-          <div className="flex gap-2">
-             <div className="flex bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 overflow-hidden">
-                <input 
-                    type="text" 
-                    placeholder="Code de deck..." 
-                    className="px-3 py-2 text-sm outline-none bg-transparent w-32"
-                    value={joinCode}
-                    onChange={(e) => setJoinCode(e.target.value)}
-                />
-                <button onClick={joinDeck} className="px-3 bg-gray-100 dark:bg-gray-700 hover:bg-gray-200 dark:hover:bg-gray-600 border-l border-gray-200 dark:border-gray-600">
-                    <Share2 size={16} />
-                </button>
-             </div>
-             <button 
-                onClick={createDeck}
-                className="flex items-center gap-2 bg-[var(--primary-color)] dark:bg-white text-white dark:text-black px-5 py-2 rounded-xl font-bold shadow-md hover:shadow-lg hover:scale-105 transition-all"
-            >
-                <Plus size={20} /> Nouveau Deck
-            </button>
           </div>
-        </div>
+        )}
 
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-          {decks.map(deck => (
-            <div 
-              key={deck.id} 
-              onClick={() => { setActiveDeck(deck); setView('play'); }}
-              className="group bg-white dark:bg-gray-800 rounded-2xl p-6 border border-gray-100 dark:border-gray-700 shadow-sm hover:shadow-xl hover:-translate-y-1 transition-all cursor-pointer relative overflow-hidden"
-            >
-              <div className="absolute top-0 left-0 w-2 h-full" style={{ backgroundColor: deck.color || theme.primaryColor }}></div>
-              <div className="flex justify-between items-start mb-4">
-                 <div className="p-3 bg-gray-50 dark:bg-gray-700 rounded-xl group-hover:bg-[var(--primary-color)] dark:group-hover:bg-white transition-colors">
-                     <Brain className="w-6 h-6 text-gray-400 group-hover:text-white dark:group-hover:text-black" />
-                 </div>
-                 <div className="flex gap-2">
-                    <button 
-                        onClick={(e) => { e.stopPropagation(); setActiveDeck(deck); setView('editor'); }}
-                        className="p-2 text-gray-400 hover:text-blue-500 rounded-full hover:bg-blue-50 dark:hover:bg-gray-700"
-                    >
-                        <Edit2 size={16} />
-                    </button>
-                    <button 
-                        onClick={(e) => deleteDeck(e, deck.id)}
-                        className="p-2 text-gray-400 hover:text-red-500 rounded-full hover:bg-red-50 dark:hover:bg-gray-700"
-                    >
-                        <Trash2 size={16} />
-                    </button>
-                 </div>
-              </div>
-              <h3 className="text-xl font-bold mb-1 truncate">{deck.title}</h3>
-              <p className="text-sm text-gray-500 mb-4">{deck.cardCount || 0} cartes • {Math.floor(Math.random() * 20)} à réviser</p>
+        {/* VUE: GAME */}
+        {view === 'game' && currentCard && (
+           <div className="max-w-2xl mx-auto flex flex-col items-center min-h-[60vh] justify-center">
               
-              <div className="flex items-center justify-between mt-4 pt-4 border-t border-gray-100 dark:border-gray-700">
-                  <span className="text-xs font-mono bg-gray-100 dark:bg-gray-700 px-2 py-1 rounded text-gray-500">#{deck.publicCode}</span>
-                  <div className="flex -space-x-2">
-                      <div className="w-8 h-8 rounded-full bg-blue-500 border-2 border-white dark:border-gray-800 flex items-center justify-center text-xs text-white font-bold">M</div>
-                      <div className="w-8 h-8 rounded-full bg-gray-300 border-2 border-white dark:border-gray-800 flex items-center justify-center text-xs text-gray-600">+</div>
-                  </div>
+              {/* GAME HEADER */}
+              <div className="w-full flex justify-between items-center mb-8 text-gray-500">
+                 <div className="flex items-center gap-2">
+                    <span className="font-bold text-[var(--primary)] text-xl">Score: {sessionScore}</span>
+                    {userStats.streak > 2 && <span className="px-2 py-0.5 bg-orange-100 text-orange-600 rounded-full text-xs font-bold animate-pulse">🔥 {userStats.streak} Streak!</span>}
+                 </div>
+                 <div className="text-sm">{gameQueue.length} cartes restantes</div>
               </div>
-            </div>
-          ))}
-          
-          {decks.length === 0 && (
-            <div className="col-span-full py-12 text-center text-gray-400 border-2 border-dashed border-gray-200 dark:border-gray-700 rounded-2xl">
-                <p>Aucun deck pour l'instant. Créez-en un pour commencer !</p>
-            </div>
-          )}
-        </div>
-      </div>
-    </div>
-  );
-}
 
-// --- ÉDITEUR DE DECK & CARTES ---
-function DeckEditor({ user, deck, onBack }) {
-  const [cards, setCards] = useState([]);
-  const [currentPath, setCurrentPath] = useState([]); // Array of strings (folder names)
-  const [deckTitle, setDeckTitle] = useState(deck.title);
-  const [newCardOpen, setNewCardOpen] = useState(false);
+              {/* THE CARD */}
+              <div className="relative w-full aspect-[3/2] perspective-1000 group cursor-pointer" onClick={() => !isFlipped && setIsFlipped(true)}>
+                 <div className={`relative w-full h-full transition-all duration-500 transform preserve-3d ${isFlipped ? 'rotate-y-180' : ''}`}>
+                    
+                    {/* FRONT */}
+                    <div className="absolute inset-0 backface-hidden bg-white dark:bg-gray-800 rounded-3xl shadow-2xl border-2 border-b-8 border-gray-100 dark:border-gray-700 flex flex-col items-center justify-center p-8 text-center">
+                       <span className="absolute top-6 left-6 text-xs font-bold uppercase tracking-widest text-gray-400">{currentCard.categoryName || 'Flashcard'}</span>
+                       {/* Priority Indicator */}
+                       {currentCard.priority === 'high' && <div className="absolute top-6 right-6 w-3 h-3 rounded-full bg-red-500 shadow-lg shadow-red-500/50"></div>}
+                       
+                       <h2 className="text-3xl md:text-4xl font-bold text-gray-800 dark:text-gray-100">{currentCard.question}</h2>
+                       <p className="mt-8 text-gray-400 text-sm animate-bounce">Cliquez pour retourner</p>
+                    </div>
 
-  // States pour la nouvelle carte
-  const [newQ, setNewQ] = useState('');
-  const [newA, setNewA] = useState('');
-  const [newType, setNewType] = useState('classic'); // classic, truefalse
-  const [newDifficulty, setNewDifficulty] = useState(3);
-
-  // Fetch Cards
-  useEffect(() => {
-    if (!user || !deck) return;
-    const q = query(
-        collection(db, 'artifacts', appId, 'users', user.uid, 'decks', deck.id, 'cards')
-    );
-    const unsubscribe = onSnapshot(q, (snapshot) => {
-      const c = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-      setCards(c);
-    });
-    return () => unsubscribe();
-  }, [user, deck]);
-
-  // Update deck title
-  const handleTitleBlur = async () => {
-      if(deckTitle !== deck.title) {
-          await updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'decks', deck.id), {
-              title: deckTitle
-          });
-      }
-  }
-
-  // Cards filtering based on current folder path
-  const visibleItems = useMemo(() => {
-      const currentPathStr = currentPath.join('/');
-      
-      // Get cards directly in this path
-      const directCards = cards.filter(c => (c.path || '') === currentPathStr);
-      
-      // Get subfolders (derived from card paths)
-      const subFolders = new Set();
-      cards.forEach(c => {
-          const path = c.path || '';
-          if (path.startsWith(currentPathStr) && path !== currentPathStr) {
-              const remaining = path.slice(currentPathStr.length ? currentPathStr.length + 1 : 0);
-              const nextFolder = remaining.split('/')[0];
-              if (nextFolder) subFolders.add(nextFolder);
-          }
-      });
-
-      return { directCards, subFolders: Array.from(subFolders) };
-  }, [cards, currentPath]);
-
-  const addCard = async () => {
-      if(!newQ || !newA) return;
-      await addDoc(collection(db, 'artifacts', appId, 'users', user.uid, 'decks', deck.id, 'cards'), {
-          question: newQ,
-          answer: newA,
-          type: newType,
-          difficulty: newDifficulty,
-          path: currentPath.join('/'),
-          createdAt: serverTimestamp(),
-          nextReview: serverTimestamp(), // Available immediately
-          interval: 0,
-          easeFactor: 2.5
-      });
-      // Update deck card count
-      await updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'decks', deck.id), {
-          cardCount: cards.length + 1
-      });
-      setNewQ(''); setNewA(''); setNewCardOpen(false);
-  };
-
-  const deleteCard = async (id) => {
-      await deleteDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'decks', deck.id, 'cards', id));
-  };
-
-  return (
-    <div className="h-[calc(100vh-100px)] flex flex-col">
-       <div className="flex items-center justify-between mb-4">
-           <div className="flex items-center gap-3">
-               <button onClick={onBack} className="p-2 hover:bg-gray-200 dark:hover:bg-gray-700 rounded-lg"><X size={20} /></button>
-               <input 
-                  value={deckTitle}
-                  onChange={(e) => setDeckTitle(e.target.value)}
-                  onBlur={handleTitleBlur}
-                  className="text-2xl font-bold bg-transparent border-b border-transparent focus:border-blue-500 outline-none w-full"
-               />
-           </div>
-           <button 
-              onClick={() => setNewCardOpen(true)}
-              className="bg-[var(--primary-color)] dark:bg-white text-white dark:text-black px-4 py-2 rounded-lg font-bold shadow flex items-center gap-2"
-           >
-               <Plus size={18} /> Ajouter Carte
-           </button>
-       </div>
-
-       {/* Breadcrumbs */}
-       <div className="flex items-center gap-2 text-sm text-gray-500 mb-4 bg-gray-100 dark:bg-gray-800 p-2 rounded-lg">
-           <FolderOpen size={16} />
-           <span className="cursor-pointer hover:text-blue-500" onClick={() => setCurrentPath([])}>Racine</span>
-           {currentPath.map((folder, idx) => (
-               <React.Fragment key={folder}>
-                   <ChevronRight size={14} />
-                   <span 
-                      className="cursor-pointer hover:text-blue-500"
-                      onClick={() => setCurrentPath(currentPath.slice(0, idx + 1))}
-                   >
-                       {folder}
-                   </span>
-               </React.Fragment>
-           ))}
-       </div>
-
-       {/* Content Area */}
-       <div className="flex-1 overflow-y-auto bg-white dark:bg-gray-800 rounded-2xl border border-gray-100 dark:border-gray-700 p-4">
-           
-           {/* Folder Creation / Grid */}
-           <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-4 mb-8">
-               {/* Create Folder Mock */}
-               <div 
-                  className="aspect-square border-2 border-dashed border-gray-200 dark:border-gray-600 rounded-xl flex flex-col items-center justify-center text-gray-400 hover:border-blue-500 hover:text-blue-500 cursor-pointer transition-all"
-                  onClick={() => {
-                      const name = prompt("Nom du dossier ?");
-                      if(name) setCurrentPath([...currentPath, name]);
-                  }}
-               >
-                   <FolderOpen size={24} />
-                   <span className="text-xs font-bold mt-2">Nouveau Dossier</span>
-               </div>
-
-               {visibleItems.subFolders.map(folder => (
-                   <div 
-                      key={folder}
-                      onClick={() => setCurrentPath([...currentPath, folder])}
-                      className="aspect-square bg-blue-50 dark:bg-gray-700 rounded-xl flex flex-col items-center justify-center text-blue-600 dark:text-blue-300 hover:bg-blue-100 dark:hover:bg-gray-600 cursor-pointer transition-all"
-                   >
-                       <FolderOpen size={32} className="fill-current" />
-                       <span className="text-xs font-bold mt-2 truncate max-w-full px-2">{folder}</span>
-                   </div>
-               ))}
-           </div>
-
-           {/* Cards List */}
-           <div className="space-y-3">
-               {visibleItems.directCards.map(card => (
-                   <div key={card.id} className="flex items-center justify-between p-4 bg-gray-50 dark:bg-gray-700/50 rounded-xl border border-gray-100 dark:border-gray-700 hover:border-blue-300 transition-colors">
-                       <div className="flex-1">
-                           <div className="font-bold text-gray-800 dark:text-gray-200">{card.question}</div>
-                           <div className="text-sm text-gray-500 truncate">{card.answer}</div>
-                       </div>
-                       <div className="flex items-center gap-3">
-                           {card.type === 'truefalse' && <span className="text-xs bg-purple-100 text-purple-600 px-2 py-1 rounded">Vrai/Faux</span>}
-                           <div className="flex gap-1">
-                               {[...Array(card.difficulty || 1)].map((_, i) => <div key={i} className="w-2 h-2 rounded-full bg-orange-400"></div>)}
-                           </div>
-                           <button onClick={() => deleteCard(card.id)} className="text-gray-400 hover:text-red-500"><Trash2 size={16} /></button>
-                       </div>
-                   </div>
-               ))}
-               {visibleItems.directCards.length === 0 && visibleItems.subFolders.length === 0 && (
-                   <div className="text-center py-10 text-gray-400">Ce dossier est vide.</div>
-               )}
-           </div>
-       </div>
-
-       {/* Modal création carte */}
-       {newCardOpen && (
-           <div className="fixed inset-0 z-[60] bg-black/50 backdrop-blur-sm flex items-center justify-center p-4">
-               <div className="bg-white dark:bg-gray-800 rounded-2xl w-full max-w-lg p-6 shadow-2xl">
-                   <h3 className="text-xl font-bold mb-4">Nouvelle Carte</h3>
-                   
-                   <div className="mb-4">
-                       <label className="block text-sm font-medium mb-1">Type</label>
-                       <div className="flex gap-2">
-                           <button 
-                              onClick={() => setNewType('classic')}
-                              className={`flex-1 py-2 rounded-lg border ${newType === 'classic' ? 'bg-blue-50 border-blue-500 text-blue-600' : 'border-gray-200'}`}
-                           >Classique</button>
-                           <button 
-                              onClick={() => setNewType('truefalse')}
-                              className={`flex-1 py-2 rounded-lg border ${newType === 'truefalse' ? 'bg-purple-50 border-purple-500 text-purple-600' : 'border-gray-200'}`}
-                           >Vrai / Faux</button>
-                       </div>
-                   </div>
-
-                   <div className="mb-4">
-                       <label className="block text-sm font-medium mb-1">Question (Face A)</label>
-                       <textarea 
-                          className="w-full p-3 rounded-lg border dark:bg-gray-700 dark:border-gray-600 outline-none focus:ring-2 focus:ring-blue-500"
-                          rows={3}
-                          value={newQ}
-                          onChange={(e) => setNewQ(e.target.value)}
-                       />
-                   </div>
-
-                   <div className="mb-4">
-                       <label className="block text-sm font-medium mb-1">Réponse (Face B)</label>
-                       {newType === 'truefalse' ? (
-                           <div className="flex gap-4">
-                               <button onClick={() => setNewA('Vrai')} className={`flex-1 py-4 rounded-lg font-bold border ${newA === 'Vrai' ? 'bg-green-100 border-green-500 text-green-700' : 'border-gray-200'}`}>VRAI</button>
-                               <button onClick={() => setNewA('Faux')} className={`flex-1 py-4 rounded-lg font-bold border ${newA === 'Faux' ? 'bg-red-100 border-red-500 text-red-700' : 'border-gray-200'}`}>FAUX</button>
-                           </div>
-                       ) : (
-                           <textarea 
-                              className="w-full p-3 rounded-lg border dark:bg-gray-700 dark:border-gray-600 outline-none focus:ring-2 focus:ring-blue-500"
-                              rows={3}
-                              value={newA}
-                              onChange={(e) => setNewA(e.target.value)}
-                           />
+                    {/* BACK */}
+                    <div className="absolute inset-0 backface-hidden bg-[var(--primary)] rotate-y-180 rounded-3xl shadow-2xl flex flex-col items-center justify-center p-8 text-center text-white">
+                       <h2 className="text-2xl md:text-3xl font-medium">{currentCard.answer}</h2>
+                       {currentCard.type === 'true_false' && (
+                          <div className="mt-4 px-4 py-2 bg-white/20 rounded-lg">C'était une question Vrai/Faux</div>
                        )}
-                   </div>
+                    </div>
+                 </div>
+              </div>
 
-                   <div className="mb-6">
-                       <label className="block text-sm font-medium mb-1">Difficulté (Étoiles)</label>
-                       <input 
-                          type="range" min="1" max="5" 
-                          value={newDifficulty} 
-                          onChange={(e) => setNewDifficulty(parseInt(e.target.value))}
-                          className="w-full accent-blue-500"
-                       />
-                       <div className="flex justify-between text-xs text-gray-400 mt-1">
-                           <span>Facile</span>
-                           <span>Hardcore</span>
-                       </div>
-                   </div>
+              {/* CONTROLS */}
+              <div className={`mt-12 w-full grid grid-cols-2 gap-6 transition-opacity duration-300 ${isFlipped ? 'opacity-100 pointer-events-auto' : 'opacity-0 pointer-events-none'}`}>
+                 <button 
+                   onClick={() => handleAnswer(false)}
+                   className="py-4 rounded-xl bg-red-500 text-white font-bold text-lg shadow-lg shadow-red-500/30 hover:bg-red-600 hover:scale-105 transition-all flex flex-col items-center"
+                 >
+                    <span>Je ne sais pas</span>
+                    <span className="text-xs font-normal opacity-75">-5 pts • Revient bientôt</span>
+                 </button>
+                 <button 
+                   onClick={() => handleAnswer(true)}
+                   className="py-4 rounded-xl bg-green-500 text-white font-bold text-lg shadow-lg shadow-green-500/30 hover:bg-green-600 hover:scale-105 transition-all flex flex-col items-center"
+                 >
+                    <span>Je sais !</span>
+                    <span className="text-xs font-normal opacity-75">+10 pts • +1 jour</span>
+                 </button>
+              </div>
 
-                   <div className="flex justify-end gap-3">
-                       <button onClick={() => setNewCardOpen(false)} className="px-4 py-2 text-gray-500 font-bold hover:bg-gray-100 rounded-lg">Annuler</button>
-                       <button onClick={addCard} className="px-6 py-2 bg-blue-600 text-white font-bold rounded-lg hover:bg-blue-700">Créer</button>
-                   </div>
-               </div>
+              <div className="mt-8">
+                 <button onClick={() => setView('lobby')} className="text-gray-400 hover:text-gray-600 text-sm">Quitter la partie</button>
+              </div>
            </div>
-       )}
+        )}
+
+      </main>
     </div>
-  );
-}
-
-// --- MODE JEU (Flashcards Player) ---
-function GameSession({ user, deck, onExit, theme }) {
-  const [sessionCards, setSessionCards] = useState([]);
-  const [currentIndex, setCurrentIndex] = useState(0);
-  const [isFlipped, setIsFlipped] = useState(false);
-  const [score, setScore] = useState(0);
-  const [streak, setStreak] = useState(0);
-  const [finished, setFinished] = useState(false);
-  const [loading, setLoading] = useState(true);
-
-  // Stats session
-  const [correctCount, setCorrectCount] = useState(0);
-  const [wrongCount, setWrongCount] = useState(0);
-
-  useEffect(() => {
-    // Load cards that are due
-    if (!user || !deck) return;
-    const loadGame = async () => {
-        const q = query(
-            collection(db, 'artifacts', appId, 'users', user.uid, 'decks', deck.id, 'cards')
-            // Dans une vraie app, on filtrerait ici: where('nextReview', '<=', new Date())
-            // Pour le prototype, on prend tout et on trie en JS
-        );
-        const snapshot = await getDocs(q);
-        let allCards = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
-        
-        // Simuler le tri par priorité/date
-        allCards.sort((a, b) => {
-             // Priorité aux cartes jamais vues (interval 0) ou dont la date est passée
-             const dateA = a.nextReview ? a.nextReview.seconds : 0;
-             const dateB = b.nextReview ? b.nextReview.seconds : 0;
-             return dateA - dateB;
-        });
-
-        // Limite pour la session
-        setSessionCards(allCards.slice(0, 20)); 
-        setLoading(false);
-    };
-    loadGame();
-  }, [user, deck]);
-
-  const handleAnswer = async (quality) => {
-      // quality: 0 (Je sais pas), 3 (Je sais)
-      const card = sessionCards[currentIndex];
-      
-      // Calculer Points
-      if (quality > 1) {
-          const multiplier = 1 + (streak * 0.1);
-          setScore(prev => Math.round(prev + (10 * multiplier)));
-          setStreak(prev => prev + 1);
-          setCorrectCount(prev => prev + 1);
-      } else {
-          setScore(prev => Math.max(0, prev - 5));
-          setStreak(0);
-          setWrongCount(prev => prev + 1);
-      }
-
-      // Mise à jour SRS Firestore
-      const { nextReview, interval, ease } = calculateNextReview(
-          card.interval || 0, 
-          card.easeFactor || 2.5, 
-          quality
-      );
-
-      await updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'decks', deck.id, 'cards', card.id), {
-          nextReview: nextReview,
-          interval: interval,
-          easeFactor: ease
-      });
-
-      // Next card
-      if (currentIndex < sessionCards.length - 1) {
-          setIsFlipped(false);
-          setTimeout(() => setCurrentIndex(prev => prev + 1), 200); // Petit délai pour l'anim
-      } else {
-          setFinished(true);
-      }
-  };
-
-  if (loading) return <div className="flex h-full items-center justify-center">Préparation du deck...</div>;
-
-  if (finished || sessionCards.length === 0) return (
-      <div className="flex flex-col items-center justify-center h-[80vh] text-center">
-          <Trophy className="w-24 h-24 text-yellow-400 mb-6 drop-shadow-lg" />
-          <h2 className="text-4xl font-extrabold mb-2">Session Terminée !</h2>
-          <p className="text-gray-500 mb-8">Beau travail.</p>
-          
-          <div className="grid grid-cols-2 gap-4 w-full max-w-sm mb-8">
-              <div className="bg-green-100 p-4 rounded-xl text-green-800">
-                  <div className="text-2xl font-bold">{correctCount}</div>
-                  <div className="text-xs uppercase font-bold opacity-75">Réussites</div>
-              </div>
-              <div className="bg-red-100 p-4 rounded-xl text-red-800">
-                  <div className="text-2xl font-bold">{wrongCount}</div>
-                  <div className="text-xs uppercase font-bold opacity-75">À Revoir</div>
-              </div>
-              <div className="bg-blue-100 p-4 rounded-xl text-blue-800 col-span-2">
-                  <div className="text-3xl font-bold">{score}</div>
-                  <div className="text-xs uppercase font-bold opacity-75">Score Final</div>
-              </div>
-          </div>
-
-          <button onClick={onExit} className="bg-gray-900 dark:bg-white text-white dark:text-black px-8 py-3 rounded-full font-bold hover:scale-105 transition-transform">
-              Retour au Lobby
-          </button>
-      </div>
-  );
-
-  const currentCard = sessionCards[currentIndex];
-
-  return (
-      <div className="h-[calc(100vh-100px)] flex flex-col items-center max-w-2xl mx-auto relative">
-          
-          {/* Header Jeu */}
-          <div className="w-full flex justify-between items-center mb-6">
-              <button onClick={onExit} className="p-2 hover:bg-gray-200 dark:hover:bg-gray-700 rounded-full"><X /></button>
-              <div className="flex flex-col items-center">
-                  <div className="text-xs font-bold text-gray-400 uppercase tracking-widest">CARTE {currentIndex + 1} / {sessionCards.length}</div>
-                  <div className="w-32 h-1 bg-gray-200 rounded-full mt-1 overflow-hidden">
-                      <div className="h-full bg-[var(--primary-color)] transition-all duration-500" style={{ width: `${((currentIndex + 1) / sessionCards.length) * 100}%` }}></div>
-                  </div>
-              </div>
-              <div className="flex items-center gap-2 font-bold text-lg">
-                  <Trophy className="w-5 h-5 text-yellow-500" />
-                  <span>{score}</span>
-              </div>
-          </div>
-
-          {/* Flashcard Area - 3D Flip Effect */}
-          <div className="relative w-full aspect-[4/3] perspective-1000 mb-8 group cursor-pointer" onClick={() => !isFlipped && setIsFlipped(true)}>
-              <div className={`relative w-full h-full transition-transform duration-500 transform-style-3d ${isFlipped ? 'rotate-y-180' : ''}`} style={{ transform: isFlipped ? 'rotateY(180deg)' : 'rotateY(0deg)' }}>
-                  
-                  {/* FRONT */}
-                  <div className="absolute inset-0 backface-hidden bg-white dark:bg-gray-800 rounded-3xl shadow-2xl border-2 border-gray-100 dark:border-gray-700 flex flex-col items-center justify-center p-8 text-center">
-                      <span className="absolute top-4 left-4 text-xs font-bold text-gray-400 uppercase bg-gray-100 dark:bg-gray-700 px-2 py-1 rounded">Question</span>
-                      {currentCard.type === 'truefalse' && <span className="absolute top-4 right-4 text-xs font-bold text-purple-500 bg-purple-100 px-2 py-1 rounded">Vrai/Faux</span>}
-                      
-                      <h3 className="text-3xl font-bold leading-tight">{currentCard.question}</h3>
-                      <p className="mt-8 text-sm text-gray-400 animate-pulse">(Appuyez pour retourner)</p>
-                  </div>
-
-                  {/* BACK */}
-                  <div className="absolute inset-0 backface-hidden bg-[var(--primary-color)] dark:bg-gray-700 text-white rounded-3xl shadow-2xl rotate-y-180 flex flex-col items-center justify-center p-8 text-center">
-                      <span className="absolute top-4 left-4 text-xs font-bold text-white/50 uppercase bg-black/20 px-2 py-1 rounded">Réponse</span>
-                      <h3 className="text-3xl font-bold leading-tight">{currentCard.answer}</h3>
-                  </div>
-              </div>
-          </div>
-
-          {/* Controls */}
-          <div className={`w-full grid grid-cols-2 gap-4 transition-opacity duration-300 ${isFlipped ? 'opacity-100 pointer-events-auto' : 'opacity-0 pointer-events-none'}`}>
-              <button 
-                  onClick={() => handleAnswer(0)}
-                  className="bg-red-100 hover:bg-red-200 text-red-600 font-bold py-4 rounded-xl flex items-center justify-center gap-2 transition-transform hover:scale-105 active:scale-95"
-              >
-                  <X size={20} /> Je ne savais pas
-              </button>
-              <button 
-                  onClick={() => handleAnswer(3)}
-                  className="bg-green-100 hover:bg-green-200 text-green-600 font-bold py-4 rounded-xl flex items-center justify-center gap-2 transition-transform hover:scale-105 active:scale-95"
-              >
-                  <Check size={20} /> Je savais !
-              </button>
-          </div>
-          
-          {/* Streak Indicator */}
-          {streak > 1 && (
-              <div className="absolute top-20 right-0 transform translate-x-12 rotate-12 bg-orange-500 text-white px-3 py-1 rounded-full font-bold shadow-lg animate-bounce">
-                  {streak}x Combo!
-              </div>
-          )}
-
-      </div>
   );
 }
