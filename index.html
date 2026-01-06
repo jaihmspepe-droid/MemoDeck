@@ -1,852 +1,660 @@
-import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { initializeApp } from "firebase/app";
-import { 
-  getAuth, 
-  signInWithPopup, 
-  GoogleAuthProvider, 
-  signInWithEmailAndPassword,
-  createUserWithEmailAndPassword,
-  signOut,
-  onAuthStateChanged,
-  signInAnonymously
-} from "firebase/auth";
-import { 
-  getFirestore, 
-  collection, 
-  addDoc, 
-  getDocs, 
-  doc, 
-  updateDoc, 
-  deleteDoc, 
-  getDoc,
-  setDoc,
-  query,
-  where
-} from "firebase/firestore";
-import { 
-  Brain, 
-  Plus, 
-  Trash2, 
-  Edit2, 
-  Play, 
-  Settings, 
-  LogOut, 
-  Moon, 
-  Sun, 
-  Folder, 
-  FolderOpen, 
-  MoreVertical, 
-  Check, 
-  X, 
-  Share2, 
-  Download, 
-  WifiOff, 
-  Image as ImageIcon,
-  FileText,
-  Save,
-  ChevronRight,
-  ChevronDown,
-  Star,
-  Award,
-  Zap,
-  LayoutDashboard,
-  ArrowLeft
-} from 'lucide-react';
-
-// --- CONFIGURATION FIREBASE ---
-const firebaseConfig = {
-  apiKey: "AIzaSyC2IfwOo9wEYgjq11WxTcxOSxNKUoLY8Wc",
-  authDomain: "memodeck-2ac00.firebaseapp.com",
-  projectId: "memodeck-2ac00",
-  storageBucket: "memodeck-2ac00.firebasestorage.app",
-  messagingSenderId: "1073357840018",
-  appId: "1:1073357840018:web:d20cddbdcc98b56458104b",
-  measurementId: "G-QBLMVGBTY3"
-};
-
-// Initialisation conditionnelle pour éviter les erreurs de rechargement
-let app, auth, db;
-try {
-  app = initializeApp(firebaseConfig);
-  auth = getAuth(app);
-  db = getFirestore(app);
-} catch (e) {
-  console.error("Firebase init error (likely double init in dev):", e);
-}
-
-// --- UTILITAIRES ---
-
-// Générateur d'ID unique simple
-const generateId = () => Math.random().toString(36).substr(2, 9);
-
-// Algorithme SRS Simplifié (Spaced Repetition)
-const calculateNextReview = (card, success) => {
-  const now = Date.now();
-  let interval = 24 * 60 * 60 * 1000; // 1 jour par défaut
-  
-  // Facteurs
-  const priorityFactor = card.priority === 'high' ? 0.8 : (card.priority === 'low' ? 1.2 : 1);
-  const difficultyFactor = (6 - (card.difficulty || 3)) / 3; // 1(dur)=1.66, 5(facile)=0.33 -> inversé car 5 = difficile dans prompt
-  // Prompt: 1=facile, 5=difficile. 
-  // Donc : Si 5 (difficile), on veut revoir bientot. Si 1 (facile), plus tard.
-  const promptDifficultyMod = card.difficulty ? (card.difficulty * 0.5) : 1; 
-
-  if (success) {
-    // Si réussi, on augmente l'intervalle
-    // Formule : Base * (Streak actuel + 1) * (Inverse de la difficulté)
-    const currentStreak = card.streak || 0;
-    interval = interval * (currentStreak + 1) * 2;
-    if (card.difficulty > 3) interval = interval * 0.5; // Si dur, revient un peu plus vite
-  } else {
-    // Si raté, revient très vite (10 minutes)
-    interval = 10 * 60 * 1000;
-  }
-
-  return now + interval;
-};
-
-// --- COMPOSANTS UI ---
-
-const Button = ({ children, onClick, variant = 'primary', className = '', ...props }) => {
-  const baseStyle = "px-4 py-2 rounded-lg font-medium transition-all duration-200 flex items-center justify-center gap-2 transform active:scale-95";
-  const variants = {
-    primary: "bg-[var(--primary)] text-white hover:opacity-90 shadow-lg shadow-[var(--primary)]/30",
-    secondary: "bg-gray-200 dark:bg-gray-700 text-gray-800 dark:text-white hover:bg-gray-300 dark:hover:bg-gray-600",
-    danger: "bg-red-500 text-white hover:bg-red-600 shadow-lg shadow-red-500/30",
-    ghost: "bg-transparent text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800",
-    success: "bg-green-500 text-white hover:bg-green-600 shadow-lg shadow-green-500/30"
-  };
-
-  return (
-    <button className={`${baseStyle} ${variants[variant]} ${className}`} onClick={onClick} {...props}>
-      {children}
-    </button>
-  );
-};
-
-const Input = ({ label, ...props }) => (
-  <div className="flex flex-col gap-1 mb-3">
-    {label && <label className="text-sm font-semibold text-gray-600 dark:text-gray-300">{label}</label>}
-    <input 
-      className="px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-900 dark:text-white focus:ring-2 focus:ring-[var(--primary)] outline-none transition-colors"
-      {...props}
-    />
-  </div>
-);
-
-const Card = ({ children, className = '' }) => (
-  <div className={`bg-white dark:bg-gray-900 rounded-xl shadow-xl border border-gray-100 dark:border-gray-800 ${className}`}>
-    {children}
-  </div>
-);
-
-// --- COMPOSANTS FONCTIONNELS ---
-
-// 1. GESTION DES CATÉGORIES RÉCURSIVES
-const CategoryTree = ({ category, onAddSub, onAddCard, onEdit, onDelete, depth = 0 }) => {
-  const [isOpen, setIsOpen] = useState(depth < 2); // Ouvre les 2 premiers niveaux par défaut
-  
-  return (
-    <div className="ml-4 border-l-2 border-gray-200 dark:border-gray-700 pl-2 mt-2">
-      <div className="flex items-center justify-between group py-1">
-        <div 
-          className="flex items-center gap-2 cursor-pointer hover:text-[var(--primary)] transition-colors"
-          onClick={() => setIsOpen(!isOpen)}
-        >
-          {category.subCategories?.length > 0 ? (
-            isOpen ? <ChevronDown size={16} /> : <ChevronRight size={16} />
-          ) : <div className="w-4" />}
-          
-          <Folder size={18} className="text-[var(--primary)]" />
-          <span className="font-medium text-gray-700 dark:text-gray-200">{category.name}</span>
-          <span className="text-xs text-gray-400">({category.cards?.length || 0} cartes)</span>
-        </div>
-
-        <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
-          <button onClick={() => onAddSub(category.id)} title="Ajouter sous-catégorie" className="p-1 hover:bg-gray-100 dark:hover:bg-gray-800 rounded"><FolderOpen size={14} /></button>
-          <button onClick={() => onAddCard(category.id)} title="Ajouter carte" className="p-1 hover:bg-gray-100 dark:hover:bg-gray-800 rounded"><Plus size={14} /></button>
-          <button onClick={() => onEdit(category)} title="Modifier" className="p-1 hover:bg-gray-100 dark:hover:bg-gray-800 rounded"><Edit2 size={14} /></button>
-          <button onClick={() => onDelete(category.id)} title="Supprimer" className="p-1 hover:bg-red-100 text-red-500 rounded"><Trash2 size={14} /></button>
-        </div>
-      </div>
-
-      {isOpen && (
-        <div>
-          {category.cards?.map(card => (
-            <div key={card.id} className="ml-6 py-1 text-sm text-gray-500 flex items-center justify-between group/card border-b border-gray-50 dark:border-gray-800">
-              <span className="truncate max-w-[200px]">{card.question}</span>
-              <div className="flex gap-1 opacity-0 group-hover/card:opacity-100">
-                <span className="text-xs font-bold text-[var(--primary)] mr-2">Diff: {card.difficulty}</span>
-                <button onClick={() => onEdit(category, card)}><Edit2 size={12} /></button>
-                <button onClick={() => onDelete(category.id, card.id)} className="text-red-500"><Trash2 size={12} /></button>
-              </div>
-            </div>
-          ))}
-          {category.subCategories?.map(sub => (
-            <CategoryTree 
-              key={sub.id} 
-              category={sub} 
-              onAddSub={onAddSub}
-              onAddCard={onAddCard}
-              onEdit={onEdit}
-              onDelete={onDelete}
-              depth={depth + 1}
-            />
-          ))}
-        </div>
-      )}
-    </div>
-  );
-};
-
-// --- MAIN APP ---
-
-export default function MemoDeckApp() {
-  // State Global
-  const [user, setUser] = useState(null);
-  const [loading, setLoading] = useState(true);
-  const [view, setView] = useState('lobby'); // lobby, editor, game, profile, login
-  
-  // State Data
-  const [decks, setDecks] = useState([]);
-  const [currentDeck, setCurrentDeck] = useState(null);
-  const [userStats, setUserStats] = useState({ totalPoints: 0, streak: 0, multiplier: 1 });
-  
-  // State UI/Theme
-  const [themeColor, setThemeColor] = useState('#3B82F6'); // Bleu par défaut
-  const [darkMode, setDarkMode] = useState(false);
-  const [notification, setNotification] = useState(null);
-
-  // Refs
-  const gameSessionRef = useRef(null);
-
-  // --- INITIALISATION ---
-
-  useEffect(() => {
-    // Theme Manager
-    const root = document.documentElement;
-    root.style.setProperty('--primary', themeColor);
-    if (darkMode) {
-      root.classList.add('dark');
-      root.style.setProperty('--bg-color', '#111827'); // gray-900
-    } else {
-      root.classList.remove('dark');
-      root.style.setProperty('--bg-color', '#F3F4F6'); // gray-100
-    }
-  }, [themeColor, darkMode]);
-
-  useEffect(() => {
-    // Auth Listener
-    const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
-      setLoading(true);
-      if (currentUser) {
-        setUser(currentUser);
-        await loadUserData(currentUser.uid);
-      } else {
-        setUser(null);
-        setDecks([]); // Clear private decks
-      }
-      setLoading(false);
-    });
-    return () => unsubscribe();
-  }, []);
-
-  // --- LOGIQUE METIER ---
-
-  const showNotification = (msg, type = 'info') => {
-    setNotification({ msg, type });
-    setTimeout(() => setNotification(null), 3000);
-  };
-
-  const loadUserData = async (uid) => {
-    try {
-      // Charger les stats
-      const statsRef = doc(db, "users", uid);
-      const statsSnap = await getDoc(statsRef);
-      if (statsSnap.exists()) {
-        const data = statsSnap.data();
-        setUserStats(data.stats || { totalPoints: 0, streak: 0, multiplier: 1 });
-        if (data.themeColor) setThemeColor(data.themeColor);
-        if (data.darkMode !== undefined) setDarkMode(data.darkMode);
-      } else {
-        // Init user
-        await setDoc(statsRef, { 
-          email: user?.email || 'guest',
-          stats: { totalPoints: 0, streak: 0, multiplier: 1 } 
-        });
-      }
-
-      // Charger les decks
-      const q = query(collection(db, "decks"), where("ownerId", "==", uid));
-      const querySnapshot = await getDocs(q);
-      const loadedDecks = [];
-      querySnapshot.forEach((doc) => {
-        loadedDecks.push({ id: doc.id, ...doc.data() });
-      });
-      setDecks(loadedDecks);
-    } catch (error) {
-      console.error("Error loading data:", error);
-      showNotification("Erreur de chargement", "error");
-    }
-  };
-
-  // Sauvegarde des préférences
-  const savePreferences = async () => {
-    if (!user || user.isAnonymous) return;
-    try {
-      await updateDoc(doc(db, "users", user.uid), {
-        themeColor,
-        darkMode
-      });
-    } catch (e) { console.error(e); }
-  };
-
-  // --- AUTHENTIFICATION ---
-
-  const handleGoogleLogin = async () => {
-    const provider = new GoogleAuthProvider();
-    try {
-      await signInWithPopup(auth, provider);
-      setView('lobby');
-    } catch (error) {
-      showNotification("Erreur de connexion Google", "error");
-    }
-  };
-
-  const handleGuestLogin = async () => {
-    try {
-      await signInAnonymously(auth);
-      showNotification("Mode Invité : Pas de sauvegarde cloud !", "warning");
-      setView('lobby');
-    } catch (error) {
-      showNotification("Erreur invité", "error");
-    }
-  };
-
-  const handleLogout = async () => {
-    await signOut(auth);
-    setView('login');
-  };
-
-  // --- GESTION DES DECKS ---
-
-  const createDeck = async () => {
-    if (!user) return;
-    const newDeck = {
-      title: "Nouveau Deck",
-      ownerId: user.uid,
-      createdAt: Date.now(),
-      rootCategory: {
-        id: generateId(),
-        name: "Racine",
-        subCategories: [],
-        cards: []
-      },
-      stats: { played: 0, lastPlayed: null },
-      shareCode: generateId().substring(0, 6).toUpperCase()
-    };
-
-    try {
-      const docRef = await addDoc(collection(db, "decks"), newDeck);
-      const deckWithId = { ...newDeck, id: docRef.id };
-      setDecks([...decks, deckWithId]);
-      setCurrentDeck(deckWithId);
-      setView('editor');
-    } catch (e) {
-      showNotification("Erreur création deck", "error");
-    }
-  };
-
-  const deleteDeck = async (deckId) => {
-    if(!confirm("Supprimer ce deck ?")) return;
-    try {
-      await deleteDoc(doc(db, "decks", deckId));
-      setDecks(decks.filter(d => d.id !== deckId));
-    } catch (e) { showNotification("Erreur suppression", "error"); }
-  };
-
-  const saveDeck = async (deckToSave) => {
-    if (!user || !deckToSave) return;
-    try {
-      // Clean undefined fields if any before saving
-      await updateDoc(doc(db, "decks", deckToSave.id), deckToSave);
-      setDecks(decks.map(d => d.id === deckToSave.id ? deckToSave : d));
-      showNotification("Deck sauvegardé !", "success");
-    } catch (e) {
-      showNotification("Erreur sauvegarde", "error");
-      console.error(e);
-    }
-  };
-
-  // Fonction récursive pour trouver et mettre à jour une catégorie
-  const updateCategoryInTree = (root, targetId, updateFn) => {
-    if (root.id === targetId) return updateFn(root);
-    if (root.subCategories) {
-      root.subCategories = root.subCategories.map(sub => updateCategoryInTree(sub, targetId, updateFn));
-    }
-    return root;
-  };
-  
-  // Fonction récursive pour trouver et supprimer une catégorie ou carte
-  const deleteFromTree = (root, targetId, type = 'category') => {
-    if (type === 'category') {
-      root.subCategories = root.subCategories.filter(sub => sub.id !== targetId);
-      root.subCategories.forEach(sub => deleteFromTree(sub, targetId, type));
-    } else {
-      // Delete card
-      if (root.cards) root.cards = root.cards.filter(c => c.id !== targetId);
-      root.subCategories.forEach(sub => deleteFromTree(sub, targetId, type));
-    }
-    return root;
-  };
-
-  // --- MODE JEU (GAME LOOP) ---
-  
-  const [gameQueue, setGameQueue] = useState([]);
-  const [currentCard, setCurrentCard] = useState(null);
-  const [isFlipped, setIsFlipped] = useState(false);
-  const [sessionScore, setSessionScore] = useState(0);
-  const [gameType, setGameType] = useState('review'); // 'review' or 'play'
-
-  const startGame = (deck, mode = 'review') => {
-    // 1. Aplatir le deck pour récupérer toutes les cartes
-    const allCards = [];
-    const traverse = (cat) => {
-      if (cat.cards) cat.cards.forEach(c => allCards.push({ ...c, categoryName: cat.name }));
-      if (cat.subCategories) cat.subCategories.forEach(traverse);
-    };
-    traverse(deck.rootCategory);
-
-    if (allCards.length === 0) {
-      showNotification("Ce deck est vide !", "warning");
-      return;
-    }
-
-    // 2. Filtrer et Trier selon SRS
-    let queue = [];
-    if (mode === 'review') {
-      const now = Date.now();
-      queue = allCards.filter(c => !c.nextReview || c.nextReview <= now);
-      // Si pas de cartes à revoir, on peut proposer de réviser les "prochaines"
-      if (queue.length === 0) {
-        if(confirm("Pas de révision urgente. Réviser en avance ?")) {
-           queue = allCards.sort((a, b) => (a.nextReview || 0) - (b.nextReview || 0)).slice(0, 20);
-        } else {
-          return;
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MemoDeck - Flashcards Intelligentes</title>
+    
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    colors: {
+                        primary: 'var(--primary)',
+                    }
+                }
+            }
         }
-      }
-      // Tri par priorité et difficulté
-      queue.sort((a, b) => {
-         // High priority first
-         if (a.priority === 'high' && b.priority !== 'high') return -1;
-         // Hardest first
-         return (b.difficulty || 3) - (a.difficulty || 3);
-      });
-    } else {
-      // Mode Libre (Shuffle)
-      queue = allCards.sort(() => Math.random() - 0.5);
-    }
+    </script>
 
-    setGameQueue(queue);
-    setSessionScore(0);
-    setGameType(mode);
-    setCurrentDeck(deck);
-    gameSessionRef.current = { correct: 0, wrong: 0, startTime: Date.now() };
+    <!-- React & ReactDOM -->
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
     
-    if (queue.length > 0) {
-      setCurrentCard(queue[0]);
-      setIsFlipped(false);
-      setView('game');
-    }
-  };
+    <!-- Babel Standalone -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
 
-  const handleAnswer = (known) => {
-    // 1. Calcul Score
-    let points = 0;
-    let newStreak = userStats.streak;
-    let newMultiplier = userStats.multiplier;
+    <!-- Firebase SDK (Compat version for HTML usage) -->
+    <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-auth-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore-compat.js"></script>
 
-    if (known) {
-      newStreak++;
-      if (newStreak % 5 === 0) newMultiplier = Math.min(newMultiplier + 0.5, 3); // Max x3
-      points = 10 * newMultiplier;
-      gameSessionRef.current.correct++;
-    } else {
-      newStreak = 0;
-      newMultiplier = 1;
-      points = -5;
-      gameSessionRef.current.wrong++;
-    }
-
-    // Update session score
-    setSessionScore(prev => prev + points);
-
-    // Update User Stats
-    const newUserStats = {
-      totalPoints: userStats.totalPoints + points,
-      streak: newStreak,
-      multiplier: newMultiplier
-    };
-    setUserStats(newUserStats);
-
-    // 2. SRS Update Logic (in local copy of deck)
-    const updatedCard = { 
-      ...currentCard, 
-      lastReviewed: Date.now(),
-      nextReview: calculateNextReview(currentCard, known),
-      streak: known ? (currentCard.streak || 0) + 1 : 0
-    };
-
-    // Mettre à jour la carte dans l'arbre du deck (Complexe en flat state, on simplifie pour le prototype)
-    // On met à jour le deck global en mémoire
-    const newRoot = updateCategoryInTree(
-        JSON.parse(JSON.stringify(currentDeck.rootCategory)), // Deep copy safe
-        null, // No ID needed for tree traversal, we need to find the card
-        (cat) => cat // Dummy
-    );
-    
-    // Fonction helper pour remplacer la carte dans l'arbre
-    const replaceCardInTree = (cat) => {
-      if(cat.cards) {
-        cat.cards = cat.cards.map(c => c.id === updatedCard.id ? updatedCard : c);
-      }
-      if(cat.subCategories) cat.subCategories.forEach(replaceCardInTree);
-    };
-    replaceCardInTree(newRoot);
-    
-    // Sauvegarder silencieusement
-    const updatedDeck = { ...currentDeck, rootCategory: newRoot };
-    setCurrentDeck(updatedDeck);
-    
-    // Si c'est en ligne, on push à Firebase (debounce idéalement, ici direct)
-    updateDoc(doc(db, "decks", currentDeck.id), { rootCategory: newRoot })
-      .catch(e => console.log("Auto-save failed", e));
-      
-    updateDoc(doc(db, "users", user.uid), { stats: newUserStats })
-       .catch(e => console.log("Stats save failed", e));
-
-
-    // 3. Next Card
-    const nextQueue = gameQueue.slice(1);
-    
-    // Si la réponse était fausse, on remet la carte un peu plus loin dans la session (optionnel, bon pour l'apprentissage)
-    if (!known && gameType === 'review') {
-        nextQueue.splice(3, 0, updatedCard); // Réinsère dans 3 tours
-    }
-
-    setGameQueue(nextQueue);
-    if (nextQueue.length > 0) {
-      setCurrentCard(nextQueue[0]);
-      setIsFlipped(false);
-    } else {
-      finishGame();
-    }
-  };
-
-  const finishGame = () => {
-    alert(`Session terminée !\nScore: ${sessionScore}\nCorrect: ${gameSessionRef.current.correct}\nFaux: ${gameSessionRef.current.wrong}`);
-    setView('lobby');
-  };
-
-  // --- VUES ---
-
-  // LOGIN VIEW
-  if (view === 'login') {
-    return (
-      <div className="min-h-screen bg-gray-50 dark:bg-gray-900 flex flex-col items-center justify-center p-4">
-        <div className="bg-white dark:bg-gray-800 p-8 rounded-2xl shadow-xl w-full max-w-md text-center">
-          <div className="flex justify-center mb-6">
-             {/* LOGO PLACEHOLDER */}
-             <div className="bg-[var(--primary)] p-4 rounded-xl shadow-lg transform rotate-3">
-                <Brain size={48} className="text-white" />
-             </div>
-          </div>
-          <h1 className="text-4xl font-black mb-2 text-gray-800 dark:text-white font-sans tracking-tighter">Memo<span className="text-[var(--primary)]">Deck</span></h1>
-          <p className="text-gray-500 mb-8">Maîtrisez tout, une carte à la fois.</p>
-
-          <div className="space-y-4">
-            <Button onClick={handleGoogleLogin} className="w-full justify-center !bg-white !text-gray-700 border border-gray-300 hover:!bg-gray-50">
-              <svg className="w-5 h-5" viewBox="0 0 24 24"><path fill="currentColor" d="M21.35 11.1h-9.17v2.73h6.51c-.33 3.81-3.5 5.44-6.5 5.44C8.36 19.27 5 16.25 5 12c0-4.1 3.2-7.27 7.2-7.27 3.09 0 4.9 1.97 4.9 1.97L19 4.72S14.86 2 12 2C6.48 2 2 6.48 2 12s4.48 10 10 10c5.19 0 8.76-3.78 8.76-9.19 0-.72-.08-1.31-.15-1.71z"/></svg>
-              Continuer avec Google
-            </Button>
-            
-            <div className="relative my-4">
-               <div className="absolute inset-0 flex items-center"><div className="w-full border-t border-gray-200 dark:border-gray-700"></div></div>
-               <div className="relative flex justify-center text-sm"><span className="px-2 bg-white dark:bg-gray-800 text-gray-500">Ou</span></div>
-            </div>
-
-            <Button onClick={handleGuestLogin} variant="ghost" className="w-full justify-center">
-              Mode Invité (Pas de sauvegarde)
-            </Button>
-          </div>
-        </div>
-      </div>
-    );
-  }
-
-  // APP LAYOUT (Lobby, Editor, Game)
-  return (
-    <div className={`min-h-screen bg-[var(--bg-color)] text-gray-900 dark:text-white font-sans transition-colors duration-300`}>
-      
-      {/* NOTIFICATION TOAST */}
-      {notification && (
-        <div className={`fixed top-4 right-4 z-50 px-6 py-3 rounded-xl shadow-2xl text-white font-medium animate-bounce 
-          ${notification.type === 'error' ? 'bg-red-500' : notification.type === 'warning' ? 'bg-orange-500' : 'bg-[var(--primary)]'}`}>
-          {notification.msg}
-        </div>
-      )}
-
-      {/* HEADER */}
-      <header className="sticky top-0 z-40 bg-white/80 dark:bg-gray-900/80 backdrop-blur-md border-b border-gray-200 dark:border-gray-800">
-        <div className="max-w-6xl mx-auto px-4 h-16 flex items-center justify-between">
-          <div className="flex items-center gap-2 cursor-pointer" onClick={() => setView('lobby')}>
-             <Brain className="text-[var(--primary)]" />
-             <span className="text-xl font-bold tracking-tight hidden sm:inline">MemoDeck</span>
-          </div>
-
-          <div className="flex items-center gap-4">
-            {/* STATS PILL */}
-            <div className="hidden md:flex items-center gap-3 bg-gray-100 dark:bg-gray-800 px-3 py-1.5 rounded-full text-sm">
-              <div className="flex items-center gap-1 text-yellow-500">
-                <Star size={14} fill="currentColor" />
-                <span className="font-bold">{userStats.totalPoints}</span>
-              </div>
-              <div className="w-px h-4 bg-gray-300 dark:bg-gray-600"></div>
-              <div className="flex items-center gap-1 text-orange-500">
-                <Zap size={14} fill="currentColor" />
-                <span className="font-bold">x{userStats.multiplier}</span>
-              </div>
-            </div>
-
-            {/* ACTIONS */}
-            <div className="flex items-center gap-2">
-               <button onClick={() => {
-                 setDarkMode(!darkMode);
-                 savePreferences();
-               }} className="p-2 rounded-full hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors">
-                 {darkMode ? <Sun size={20} /> : <Moon size={20} />}
-               </button>
-               
-               <div className="h-8 w-8 rounded-full bg-gradient-to-tr from-[var(--primary)] to-purple-500 flex items-center justify-center text-white font-bold text-xs">
-                 {user?.isAnonymous ? 'G' : user?.email?.[0].toUpperCase()}
-               </div>
-               
-               <button onClick={handleLogout} className="text-gray-500 hover:text-red-500"><LogOut size={20}/></button>
-            </div>
-          </div>
-        </div>
-      </header>
-
-      {/* CONTENT */}
-      <main className="max-w-6xl mx-auto px-4 py-8">
+    <style>
+        /* Variables CSS dynamiques */
+        :root {
+            --primary: #3B82F6;
+            --bg-color: #F3F4F6;
+        }
+        .dark {
+            --bg-color: #111827;
+        }
+        body {
+            background-color: var(--bg-color);
+            transition: background-color 0.3s;
+        }
         
-        {/* VUE: LOBBY */}
-        {view === 'lobby' && (
-          <div className="space-y-8">
-            <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
-              <div>
-                <h2 className="text-3xl font-bold mb-1">Mes Decks</h2>
-                <p className="text-gray-500 dark:text-gray-400">Prêt à réviser aujourd'hui ?</p>
-              </div>
-              <div className="flex gap-2 w-full md:w-auto">
-                <div className="relative flex-1 md:flex-none">
-                    <input type="text" placeholder="Entrer un code..." className="pl-3 py-2 rounded-lg border dark:bg-gray-800 dark:border-gray-700 w-full" />
-                    <button className="absolute right-2 top-2 text-[var(--primary)]"><Download size={18}/></button>
-                </div>
-                <Button onClick={createDeck}><Plus size={18} /> Créer</Button>
-              </div>
+        /* 3D Flip Animation */
+        .perspective-1000 { perspective: 1000px; }
+        .transform-style-3d { transform-style: preserve-3d; }
+        .backface-hidden { backface-visibility: hidden; }
+        .rotate-y-180 { transform: rotateY(180deg); }
+        .preserve-3d { transform-style: preserve-3d; }
+        
+        /* Custom Scrollbar */
+        ::-webkit-scrollbar { width: 8px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
+        .dark ::-webkit-scrollbar-thumb { background: #475569; }
+        ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        // --- 1. CONFIGURATION FIREBASE ---
+        const firebaseConfig = {
+            apiKey: "AIzaSyC2IfwOo9wEYgjq11WxTcxOSxNKUoLY8Wc",
+            authDomain: "memodeck-2ac00.firebaseapp.com",
+            projectId: "memodeck-2ac00",
+            storageBucket: "memodeck-2ac00.firebasestorage.app",
+            messagingSenderId: "1073357840018",
+            appId: "1:1073357840018:web:d20cddbdcc98b56458104b",
+            measurementId: "G-QBLMVGBTY3"
+        };
+
+        // Initialisation Firebase
+        if (!firebase.apps.length) {
+            firebase.initializeApp(firebaseConfig);
+        }
+        const auth = firebase.auth();
+        const db = firebase.firestore();
+
+        // --- 2. LOGIQUE REACT ---
+        const { useState, useEffect, useRef } = React;
+
+        // --- ICONES SVG (Composant simple) ---
+        const Icon = ({ name, size = 20, className = "" }) => {
+            const icons = {
+                Brain: <path d="M9.5 2A2.5 2.5 0 0 1 12 4.5v15a2.5 2.5 0 0 1-4.96.44 2.5 2.5 0 0 1-2.96-3.08 3 3 0 0 1-.34-5.58 2.5 2.5 0 0 1 1.32-4.24 2.5 2.5 0 0 1 1.98-3A2.5 2.5 0 0 1 9.5 2Z M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 4.96.44 2.5 2.5 0 0 0 2.96-3.08 3 3 0 0 0 .34-5.58 2.5 2.5 0 0 0-1.32-4.24 2.5 2.5 0 0 0-1.98-3A2.5 2.5 0 0 0 14.5 2Z"/>,
+                Plus: <path d="M5 12h14M12 5v14"/>,
+                Trash2: <path d="M3 6h18M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2M10 11v6M14 11v6"/>,
+                Edit2: <path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"/>,
+                Play: <polygon points="5 3 19 12 5 21 5 3"/>,
+                LogOut: <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/>,
+                Moon: <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>,
+                Sun: <><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></>,
+                Folder: <path d="M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.93a2 2 0 0 1-1.66-.9l-.82-1.2A2 2 0 0 0 7.93 2H4a2 2 0 0 0-2 2v13c0 1.1.9 2 2 2Z"/>,
+                FolderOpen: <path d="m6 14 1.45-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.55 6a2 2 0 0 1-1.94 1.5H4a2 2 0 0 1-2-2V5c0-1.1.9-2 2-2h3.93a2 2 0 0 1 1.66.9l.82 1.2a2 2 0 0 0 1.66.9H18a2 2 0 0 0 2-2v2"/>,
+                ChevronRight: <path d="m9 18 6-6-6-6"/>,
+                ChevronDown: <path d="m6 9 6 6 6-6"/>,
+                Star: <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/>,
+                Zap: <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>,
+                Download: <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/>,
+                ArrowLeft: <path d="M19 12H5M12 19l-7-7 7-7"/>,
+                Save: <><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></>,
+                FileText: <><path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></>
+            };
+            
+            return (
+                <svg 
+                    xmlns="http://www.w3.org/2000/svg" 
+                    width={size} 
+                    height={size} 
+                    viewBox="0 0 24 24" 
+                    fill="none" 
+                    stroke="currentColor" 
+                    strokeWidth="2" 
+                    strokeLinecap="round" 
+                    strokeLinejoin="round" 
+                    className={className}
+                >
+                    {icons[name] || <circle cx="12" cy="12" r="10" />}
+                </svg>
+            );
+        };
+
+        // --- UTILITAIRES ---
+        const generateId = () => Math.random().toString(36).substr(2, 9);
+
+        // Algorithme SRS Simplifié
+        const calculateNextReview = (card, success) => {
+            const now = Date.now();
+            let interval = 24 * 60 * 60 * 1000; // 1 jour
+            
+            if (success) {
+                const currentStreak = card.streak || 0;
+                interval = interval * (currentStreak + 1) * 2;
+                if (card.difficulty > 3) interval = interval * 0.5;
+            } else {
+                interval = 10 * 60 * 1000; // 10 min
+            }
+            return now + interval;
+        };
+
+        // --- UI COMPONENTS ---
+        const Button = ({ children, onClick, variant = 'primary', className = '', ...props }) => {
+            const baseStyle = "px-4 py-2 rounded-lg font-medium transition-all duration-200 flex items-center justify-center gap-2 transform active:scale-95";
+            const variants = {
+                primary: "bg-[var(--primary)] text-white hover:opacity-90 shadow-lg shadow-blue-500/30",
+                secondary: "bg-gray-200 dark:bg-gray-700 text-gray-800 dark:text-white hover:bg-gray-300 dark:hover:bg-gray-600",
+                danger: "bg-red-500 text-white hover:bg-red-600 shadow-lg shadow-red-500/30",
+                ghost: "bg-transparent text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800",
+                success: "bg-green-500 text-white hover:bg-green-600 shadow-lg shadow-green-500/30"
+            };
+            return <button className={`${baseStyle} ${variants[variant]} ${className}`} onClick={onClick} {...props}>{children}</button>;
+        };
+
+        const CardContainer = ({ children, className = '', onClick }) => (
+            <div onClick={onClick} className={`bg-white dark:bg-gray-900 rounded-xl shadow-xl border border-gray-100 dark:border-gray-800 ${className}`}>
+                {children}
             </div>
+        );
 
-            {/* GRID DECKS */}
-            {loading ? <p>Chargement...</p> : (
-              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-                {decks.map(deck => (
-                  <Card key={deck.id} className="group hover:-translate-y-1 transition-transform duration-300 cursor-pointer relative overflow-hidden">
-                    <div className="absolute top-0 left-0 w-2 h-full bg-[var(--primary)]"></div>
-                    <div className="p-6">
-                      <div className="flex justify-between items-start mb-4">
-                        <h3 className="text-xl font-bold truncate pr-4">{deck.title}</h3>
-                        <div className="flex gap-1">
-                           <button onClick={(e) => { e.stopPropagation(); setCurrentDeck(deck); setView('editor'); }} className="p-2 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-full text-gray-400 hover:text-[var(--primary)]"><Edit2 size={16}/></button>
-                           <button onClick={(e) => { e.stopPropagation(); deleteDeck(deck.id); }} className="p-2 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-full text-gray-400 hover:text-red-500"><Trash2 size={16}/></button>
+        // --- TREE COMPONENT ---
+        const CategoryTree = ({ category, onAddSub, onAddCard, onEdit, onDelete, depth = 0 }) => {
+            const [isOpen, setIsOpen] = useState(depth < 2);
+            
+            return (
+                <div className="ml-4 border-l-2 border-gray-200 dark:border-gray-700 pl-2 mt-2">
+                    <div className="flex items-center justify-between group py-1">
+                        <div 
+                            className="flex items-center gap-2 cursor-pointer hover:text-[var(--primary)] transition-colors"
+                            onClick={() => setIsOpen(!isOpen)}
+                        >
+                            {category.subCategories?.length > 0 ? (
+                                isOpen ? <Icon name="ChevronDown" size={16} /> : <Icon name="ChevronRight" size={16} />
+                            ) : <div className="w-4" />}
+                            
+                            <Icon name="Folder" size={18} className="text-[var(--primary)]" />
+                            <span className="font-medium text-gray-700 dark:text-gray-200">{category.name}</span>
+                            <span className="text-xs text-gray-400">({category.cards?.length || 0})</span>
                         </div>
-                      </div>
-                      
-                      <div className="flex justify-between items-end mt-8">
-                        <div className="text-sm text-gray-500">
-                           <div className="flex items-center gap-1"><Folder size={14}/> {deck.rootCategory.subCategories?.length || 0} Cats</div>
-                           <div className="flex items-center gap-1 mt-1"><FileText size={14}/> {deck.stats?.played || 0} sessions</div>
+
+                        <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                            <button onClick={() => onAddSub(category.id)} title="Ajouter sous-cat" className="p-1 hover:bg-gray-100 dark:hover:bg-gray-800 rounded"><Icon name="FolderOpen" size={14} /></button>
+                            <button onClick={() => onAddCard(category.id)} title="Ajouter carte" className="p-1 hover:bg-gray-100 dark:hover:bg-gray-800 rounded"><Icon name="Plus" size={14} /></button>
+                            <button onClick={() => onEdit(category)} title="Modifier" className="p-1 hover:bg-gray-100 dark:hover:bg-gray-800 rounded"><Icon name="Edit2" size={14} /></button>
+                            <button onClick={() => onDelete(category.id)} title="Supprimer" className="p-1 hover:bg-red-100 text-red-500 rounded"><Icon name="Trash2" size={14} /></button>
                         </div>
-                        <Button onClick={() => startGame(deck, 'review')} className="rounded-full !px-6 shadow-xl shadow-[var(--primary)]/20">
-                           <Play size={18} fill="currentColor" /> Jouer
-                        </Button>
-                      </div>
                     </div>
-                  </Card>
-                ))}
+
+                    {isOpen && (
+                        <div>
+                            {category.cards?.map(card => (
+                                <div key={card.id} className="ml-6 py-1 text-sm text-gray-500 flex items-center justify-between group/card border-b border-gray-50 dark:border-gray-800">
+                                    <span className="truncate max-w-[200px]">{card.question}</span>
+                                    <div className="flex gap-1 opacity-0 group-hover/card:opacity-100">
+                                        <button onClick={() => onEdit(category, card)}><Icon name="Edit2" size={12} /></button>
+                                        <button onClick={() => onDelete(category.id, card.id)} className="text-red-500"><Icon name="Trash2" size={12} /></button>
+                                    </div>
+                                </div>
+                            ))}
+                            {category.subCategories?.map(sub => (
+                                <CategoryTree 
+                                    key={sub.id} 
+                                    category={sub} 
+                                    onAddSub={onAddSub}
+                                    onAddCard={onAddCard}
+                                    onEdit={onEdit}
+                                    onDelete={onDelete}
+                                    depth={depth + 1}
+                                />
+                            ))}
+                        </div>
+                    )}
+                </div>
+            );
+        };
+
+        // --- APP MAIN ---
+        function MemoDeckApp() {
+            const [user, setUser] = useState(null);
+            const [loading, setLoading] = useState(true);
+            const [view, setView] = useState('lobby'); // lobby, editor, game, login
+            
+            const [decks, setDecks] = useState([]);
+            const [currentDeck, setCurrentDeck] = useState(null);
+            const [userStats, setUserStats] = useState({ totalPoints: 0, streak: 0, multiplier: 1 });
+            
+            const [themeColor, setThemeColor] = useState('#3B82F6');
+            const [darkMode, setDarkMode] = useState(false);
+            const [notification, setNotification] = useState(null);
+
+            // Refs pour le jeu
+            const gameSessionRef = useRef(null);
+            const [gameQueue, setGameQueue] = useState([]);
+            const [currentCard, setCurrentCard] = useState(null);
+            const [isFlipped, setIsFlipped] = useState(false);
+            const [sessionScore, setSessionScore] = useState(0);
+
+            // Theme Effect
+            useEffect(() => {
+                const root = document.documentElement;
+                root.style.setProperty('--primary', themeColor);
+                if (darkMode) root.classList.add('dark');
+                else root.classList.remove('dark');
+            }, [themeColor, darkMode]);
+
+            // Auth Effect
+            useEffect(() => {
+                const unsubscribe = auth.onAuthStateChanged(async (currentUser) => {
+                    setLoading(true);
+                    if (currentUser) {
+                        setUser(currentUser);
+                        await loadUserData(currentUser.uid);
+                    } else {
+                        setUser(null);
+                        setDecks([]);
+                    }
+                    setLoading(false);
+                });
+                return () => unsubscribe();
+            }, []);
+
+            // Data Loading
+            const loadUserData = async (uid) => {
+                try {
+                    const statsRef = db.collection("users").doc(uid);
+                    const statsSnap = await statsRef.get();
+                    if (statsSnap.exists) {
+                        const data = statsSnap.data();
+                        setUserStats(data.stats || { totalPoints: 0, streak: 0, multiplier: 1 });
+                        if (data.themeColor) setThemeColor(data.themeColor);
+                        if (data.darkMode !== undefined) setDarkMode(data.darkMode);
+                    } else {
+                        await statsRef.set({ 
+                            email: user?.email || 'guest',
+                            stats: { totalPoints: 0, streak: 0, multiplier: 1 } 
+                        });
+                    }
+
+                    const decksSnap = await db.collection("decks").where("ownerId", "==", uid).get();
+                    const loadedDecks = [];
+                    decksSnap.forEach((doc) => {
+                        loadedDecks.push({ id: doc.id, ...doc.data() });
+                    });
+                    setDecks(loadedDecks);
+                } catch (error) {
+                    console.error("Error loading data:", error);
+                }
+            };
+
+            const showNotification = (msg, type = 'info') => {
+                setNotification({ msg, type });
+                setTimeout(() => setNotification(null), 3000);
+            };
+
+            // Handlers
+            const handleGoogleLogin = async () => {
+                const provider = new firebase.auth.GoogleAuthProvider();
+                try {
+                    await auth.signInWithPopup(provider);
+                    setView('lobby');
+                } catch (e) { showNotification("Erreur Google", "error"); }
+            };
+
+            const handleGuestLogin = async () => {
+                try {
+                    await auth.signInAnonymously();
+                    showNotification("Mode Invité: Pas de sauvegarde", "warning");
+                    setView('lobby');
+                } catch (e) { showNotification("Erreur Invité", "error"); }
+            };
+
+            const handleLogout = async () => {
+                await auth.signOut();
+                setView('login');
+            };
+
+            // Deck Operations
+            const createDeck = async () => {
+                if (!user) return;
+                const newDeck = {
+                    title: "Nouveau Deck",
+                    ownerId: user.uid,
+                    createdAt: Date.now(),
+                    rootCategory: {
+                        id: generateId(),
+                        name: "Racine",
+                        subCategories: [],
+                        cards: []
+                    },
+                    stats: { played: 0 },
+                    shareCode: generateId().substring(0, 6).toUpperCase()
+                };
+
+                try {
+                    const docRef = await db.collection("decks").add(newDeck);
+                    const deckWithId = { ...newDeck, id: docRef.id };
+                    setDecks([...decks, deckWithId]);
+                    setCurrentDeck(deckWithId);
+                    setView('editor');
+                } catch (e) { showNotification("Erreur création", "error"); }
+            };
+
+            const deleteDeck = async (deckId) => {
+                if(!confirm("Supprimer ?")) return;
+                try {
+                    await db.collection("decks").doc(deckId).delete();
+                    setDecks(decks.filter(d => d.id !== deckId));
+                } catch(e) { showNotification("Erreur suppression", "error"); }
+            };
+
+            const saveDeck = async (deckToSave) => {
+                if (!user || !deckToSave) return;
+                try {
+                    await db.collection("decks").doc(deckToSave.id).update(deckToSave);
+                    setDecks(decks.map(d => d.id === deckToSave.id ? deckToSave : d));
+                    showNotification("Sauvegardé !", "success");
+                } catch(e) { console.error(e); }
+            };
+
+            // Tree Helpers
+            const updateCategoryInTree = (root, targetId, updateFn) => {
+                if (root.id === targetId) return updateFn(root);
+                if (root.subCategories) {
+                    root.subCategories = root.subCategories.map(sub => updateCategoryInTree(sub, targetId, updateFn));
+                }
+                return root;
+            };
+
+            const deleteFromTree = (root, targetId, type) => {
+                if (type === 'category') {
+                    root.subCategories = root.subCategories.filter(sub => sub.id !== targetId);
+                    root.subCategories.forEach(sub => deleteFromTree(sub, targetId, type));
+                } else {
+                    if (root.cards) root.cards = root.cards.filter(c => c.id !== targetId);
+                    root.subCategories.forEach(sub => deleteFromTree(sub, targetId, type));
+                }
+                return root;
+            };
+
+            // GAME LOGIC
+            const startGame = (deck) => {
+                // Flatten deck
+                const allCards = [];
+                const traverse = (cat) => {
+                    if (cat.cards) cat.cards.forEach(c => allCards.push({ ...c, categoryName: cat.name }));
+                    if (cat.subCategories) cat.subCategories.forEach(traverse);
+                };
+                traverse(deck.rootCategory);
+
+                if (allCards.length === 0) {
+                    showNotification("Deck vide !", "warning");
+                    return;
+                }
+
+                // Simple SRS sort (simplified for single file)
+                const now = Date.now();
+                let queue = allCards.filter(c => !c.nextReview || c.nextReview <= now);
+                if (queue.length === 0) queue = allCards.sort(() => Math.random() - 0.5).slice(0, 10); // Fallback random
                 
-                {decks.length === 0 && (
-                   <div className="col-span-full py-20 text-center border-2 border-dashed border-gray-300 dark:border-gray-700 rounded-xl">
-                      <p className="text-gray-500">Aucun deck pour le moment.</p>
-                      <button onClick={createDeck} className="text-[var(--primary)] font-bold mt-2 hover:underline">Créer mon premier deck</button>
-                   </div>
-                )}
-              </div>
-            )}
-          </div>
-        )}
+                setGameQueue(queue);
+                setSessionScore(0);
+                setCurrentDeck(deck);
+                gameSessionRef.current = { correct: 0, wrong: 0 };
+                
+                if (queue.length > 0) {
+                    setCurrentCard(queue[0]);
+                    setIsFlipped(false);
+                    setView('game');
+                }
+            };
 
-        {/* VUE: EDITOR */}
-        {view === 'editor' && currentDeck && (
-          <div className="animate-fade-in">
-             <div className="flex items-center gap-4 mb-6">
-               <button onClick={() => { saveDeck(currentDeck); setView('lobby'); }} className="p-2 hover:bg-gray-200 dark:hover:bg-gray-800 rounded-full"><ArrowLeft /></button>
-               <input 
-                 value={currentDeck.title} 
-                 onChange={(e) => setCurrentDeck({...currentDeck, title: e.target.value})}
-                 className="text-3xl font-bold bg-transparent border-none focus:ring-0 w-full"
-               />
-               <Button onClick={() => saveDeck(currentDeck)} variant="success"><Save size={18} /> Sauvegarder</Button>
-             </div>
+            const handleAnswer = (known) => {
+                // Score
+                let points = 0;
+                let newStreak = userStats.streak;
+                let newMultiplier = userStats.multiplier;
 
-             <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
-                {/* TREE STRUCTURE */}
-                <div className="lg:col-span-1 bg-white dark:bg-gray-800 p-6 rounded-xl shadow-sm h-fit">
-                   <h3 className="font-bold text-gray-500 uppercase text-xs tracking-wider mb-4">Structure du Deck</h3>
-                   <CategoryTree 
-                      category={currentDeck.rootCategory}
-                      onAddSub={(parentId) => {
-                        const name = prompt("Nom de la sous-catégorie ?");
-                        if(!name) return;
-                        const newCat = { id: generateId(), name, subCategories: [], cards: [] };
-                        const newRoot = updateCategoryInTree({...currentDeck.rootCategory}, parentId, (cat) => ({
-                           ...cat, subCategories: [...(cat.subCategories||[]), newCat]
-                        }));
-                        setCurrentDeck({...currentDeck, rootCategory: newRoot});
-                      }}
-                      onAddCard={(catId) => {
-                         // Open Card Modal or simple prompt
-                         const q = prompt("Question ?");
-                         const a = prompt("Réponse ?");
-                         if(!q || !a) return;
-                         const newCard = { 
-                            id: generateId(), 
-                            question: q, 
-                            answer: a, 
-                            difficulty: 3, 
-                            priority: 'normal',
-                            type: 'classic', // or true_false
-                            createdAt: Date.now()
-                         };
-                         const newRoot = updateCategoryInTree({...currentDeck.rootCategory}, catId, (cat) => ({
-                           ...cat, cards: [...(cat.cards||[]), newCard]
-                        }));
-                        setCurrentDeck({...currentDeck, rootCategory: newRoot});
-                      }}
-                      onEdit={(item, card) => {
-                         if(card) {
-                            // Edit Card Logic (Simplified)
-                            const q = prompt("Nouvelle Question", card.question);
-                            const a = prompt("Nouvelle Réponse", card.answer);
-                            if(q) {
-                               // This needs a proper recursive update for cards, simplified here:
-                               // In a real app, use a Modal with state
-                               alert("Modification rapide non implémentée dans cette démo (Utiliser Supprimer + Ajouter)");
-                            }
-                         } else {
-                            // Edit Category
-                            const name = prompt("Renommer catégorie", item.name);
-                            if(name) {
-                               const newRoot = updateCategoryInTree({...currentDeck.rootCategory}, item.id, (cat) => ({...cat, name}));
-                               setCurrentDeck({...currentDeck, rootCategory: newRoot});
-                            }
-                         }
-                      }}
-                      onDelete={(parentId, cardId) => {
-                         if(!confirm("Supprimer ?")) return;
-                         const newRoot = deleteFromTree({...currentDeck.rootCategory}, cardId || parentId, cardId ? 'card' : 'category');
-                         setCurrentDeck({...currentDeck, rootCategory: newRoot});
-                      }}
-                   />
-                </div>
+                if (known) {
+                    newStreak++;
+                    if (newStreak % 5 === 0) newMultiplier = Math.min(newMultiplier + 0.5, 3);
+                    points = 10 * newMultiplier;
+                    gameSessionRef.current.correct++;
+                } else {
+                    newStreak = 0;
+                    newMultiplier = 1;
+                    points = -5;
+                    gameSessionRef.current.wrong++;
+                }
 
-                {/* PREVIEW / HELP */}
-                <div className="lg:col-span-2 bg-blue-50 dark:bg-gray-800/50 border border-blue-100 dark:border-gray-700 p-8 rounded-xl flex flex-col items-center justify-center text-center text-gray-500">
-                   <Brain size={64} className="text-blue-200 mb-4" />
-                   <h3 className="text-lg font-medium text-gray-700 dark:text-gray-300">Mode Édition</h3>
-                   <p className="max-w-md mt-2">Utilisez l'arbre à gauche pour structurer votre deck. Ajoutez des catégories infinies et insérez des cartes.</p>
-                   <div className="mt-6 flex gap-2">
-                      <span className="px-2 py-1 bg-white dark:bg-gray-900 rounded text-xs border">Question / Réponse</span>
-                      <span className="px-2 py-1 bg-white dark:bg-gray-900 rounded text-xs border">Vrai / Faux</span>
-                      <span className="px-2 py-1 bg-white dark:bg-gray-900 rounded text-xs border">Images</span>
-                   </div>
-                </div>
-             </div>
-          </div>
-        )}
+                setSessionScore(s => s + points);
+                setUserStats({ totalPoints: userStats.totalPoints + points, streak: newStreak, multiplier: newMultiplier });
 
-        {/* VUE: GAME */}
-        {view === 'game' && currentCard && (
-           <div className="max-w-2xl mx-auto flex flex-col items-center min-h-[60vh] justify-center">
-              
-              {/* GAME HEADER */}
-              <div className="w-full flex justify-between items-center mb-8 text-gray-500">
-                 <div className="flex items-center gap-2">
-                    <span className="font-bold text-[var(--primary)] text-xl">Score: {sessionScore}</span>
-                    {userStats.streak > 2 && <span className="px-2 py-0.5 bg-orange-100 text-orange-600 rounded-full text-xs font-bold animate-pulse">🔥 {userStats.streak} Streak!</span>}
-                 </div>
-                 <div className="text-sm">{gameQueue.length} cartes restantes</div>
-              </div>
+                // Update Card Data
+                const updatedCard = { 
+                    ...currentCard, 
+                    nextReview: calculateNextReview(currentCard, known),
+                    streak: known ? (currentCard.streak || 0) + 1 : 0
+                };
 
-              {/* THE CARD */}
-              <div className="relative w-full aspect-[3/2] perspective-1000 group cursor-pointer" onClick={() => !isFlipped && setIsFlipped(true)}>
-                 <div className={`relative w-full h-full transition-all duration-500 transform preserve-3d ${isFlipped ? 'rotate-y-180' : ''}`}>
-                    
-                    {/* FRONT */}
-                    <div className="absolute inset-0 backface-hidden bg-white dark:bg-gray-800 rounded-3xl shadow-2xl border-2 border-b-8 border-gray-100 dark:border-gray-700 flex flex-col items-center justify-center p-8 text-center">
-                       <span className="absolute top-6 left-6 text-xs font-bold uppercase tracking-widest text-gray-400">{currentCard.categoryName || 'Flashcard'}</span>
-                       {/* Priority Indicator */}
-                       {currentCard.priority === 'high' && <div className="absolute top-6 right-6 w-3 h-3 rounded-full bg-red-500 shadow-lg shadow-red-500/50"></div>}
-                       
-                       <h2 className="text-3xl md:text-4xl font-bold text-gray-800 dark:text-gray-100">{currentCard.question}</h2>
-                       <p className="mt-8 text-gray-400 text-sm animate-bounce">Cliquez pour retourner</p>
+                // Update Tree in Memory
+                const newRoot = updateCategoryInTree(
+                    JSON.parse(JSON.stringify(currentDeck.rootCategory)),
+                    null,
+                    (cat) => cat // Dummy
+                );
+                
+                // Helper to find and replace
+                const replaceCard = (cat) => {
+                    if(cat.cards) cat.cards = cat.cards.map(c => c.id === updatedCard.id ? updatedCard : c);
+                    if(cat.subCategories) cat.subCategories.forEach(replaceCard);
+                };
+                replaceCard(newRoot);
+                
+                // Save silently
+                db.collection("decks").doc(currentDeck.id).update({ rootCategory: newRoot });
+                db.collection("users").doc(user.uid).update({ stats: { totalPoints: userStats.totalPoints + points, streak: newStreak, multiplier: newMultiplier } });
+
+                // Next Card
+                const nextQueue = gameQueue.slice(1);
+                if (!known) nextQueue.splice(3, 0, updatedCard); // Reinsert later
+
+                setGameQueue(nextQueue);
+                if (nextQueue.length > 0) {
+                    setCurrentCard(nextQueue[0]);
+                    setIsFlipped(false);
+                } else {
+                    alert(`Fini ! Score: ${sessionScore + points}`);
+                    setView('lobby');
+                }
+            };
+
+            // --- RENDER VIEWS ---
+
+            if (view === 'login') {
+                return (
+                    <div className="min-h-screen flex flex-col items-center justify-center p-4">
+                        <div className="bg-white dark:bg-gray-800 p-8 rounded-2xl shadow-xl max-w-md w-full text-center">
+                            <div className="flex justify-center mb-6">
+                                <div className="bg-[var(--primary)] p-4 rounded-xl shadow-lg transform rotate-3 text-white">
+                                    <Icon name="Brain" size={48} />
+                                </div>
+                            </div>
+                            <h1 className="text-4xl font-black mb-2 dark:text-white">Memo<span className="text-[var(--primary)]">Deck</span></h1>
+                            <p className="text-gray-500 mb-8">Révisez intelligemment.</p>
+                            <div className="space-y-4">
+                                <Button onClick={handleGoogleLogin} variant="secondary" className="w-full justify-center">Connexion Google</Button>
+                                <div className="text-xs text-gray-400">ou</div>
+                                <Button onClick={handleGuestLogin} variant="ghost" className="w-full justify-center">Mode Invité</Button>
+                            </div>
+                        </div>
                     </div>
+                );
+            }
 
-                    {/* BACK */}
-                    <div className="absolute inset-0 backface-hidden bg-[var(--primary)] rotate-y-180 rounded-3xl shadow-2xl flex flex-col items-center justify-center p-8 text-center text-white">
-                       <h2 className="text-2xl md:text-3xl font-medium">{currentCard.answer}</h2>
-                       {currentCard.type === 'true_false' && (
-                          <div className="mt-4 px-4 py-2 bg-white/20 rounded-lg">C'était une question Vrai/Faux</div>
-                       )}
-                    </div>
-                 </div>
-              </div>
+            return (
+                <div className="min-h-screen pb-10">
+                    {/* TOAST */}
+                    {notification && (
+                        <div className={`fixed top-4 right-4 z-50 px-6 py-3 rounded-xl shadow-2xl text-white font-medium animate-bounce ${notification.type === 'error' ? 'bg-red-500' : 'bg-[var(--primary)]'}`}>
+                            {notification.msg}
+                        </div>
+                    )}
 
-              {/* CONTROLS */}
-              <div className={`mt-12 w-full grid grid-cols-2 gap-6 transition-opacity duration-300 ${isFlipped ? 'opacity-100 pointer-events-auto' : 'opacity-0 pointer-events-none'}`}>
-                 <button 
-                   onClick={() => handleAnswer(false)}
-                   className="py-4 rounded-xl bg-red-500 text-white font-bold text-lg shadow-lg shadow-red-500/30 hover:bg-red-600 hover:scale-105 transition-all flex flex-col items-center"
-                 >
-                    <span>Je ne sais pas</span>
-                    <span className="text-xs font-normal opacity-75">-5 pts • Revient bientôt</span>
-                 </button>
-                 <button 
-                   onClick={() => handleAnswer(true)}
-                   className="py-4 rounded-xl bg-green-500 text-white font-bold text-lg shadow-lg shadow-green-500/30 hover:bg-green-600 hover:scale-105 transition-all flex flex-col items-center"
-                 >
-                    <span>Je sais !</span>
-                    <span className="text-xs font-normal opacity-75">+10 pts • +1 jour</span>
-                 </button>
-              </div>
+                    {/* HEADER */}
+                    <header className="sticky top-0 z-40 bg-white/80 dark:bg-gray-900/80 backdrop-blur-md border-b border-gray-200 dark:border-gray-800 mb-8">
+                        <div className="max-w-6xl mx-auto px-4 h-16 flex items-center justify-between">
+                            <div className="flex items-center gap-2 cursor-pointer" onClick={() => setView('lobby')}>
+                                <Icon name="Brain" className="text-[var(--primary)]" />
+                                <span className="text-xl font-bold dark:text-white">MemoDeck</span>
+                            </div>
+                            <div className="flex items-center gap-4">
+                                <div className="hidden md:flex items-center gap-3 bg-gray-100 dark:bg-gray-800 px-3 py-1 rounded-full text-sm">
+                                    <div className="flex items-center gap-1 text-yellow-500"><Icon name="Star" size={14} /><span className="font-bold">{userStats.totalPoints}</span></div>
+                                    <div className="w-px h-4 bg-gray-300"></div>
+                                    <div className="flex items-center gap-1 text-orange-500"><Icon name="Zap" size={14} /><span>x{userStats.multiplier}</span></div>
+                                </div>
+                                <button onClick={() => { setDarkMode(!darkMode); }} className="p-2 rounded-full hover:bg-gray-200 dark:hover:bg-gray-700 dark:text-white">
+                                    {darkMode ? <Icon name="Sun" size={20} /> : <Icon name="Moon" size={20} />}
+                                </button>
+                                <button onClick={handleLogout} className="text-gray-500 hover:text-red-500"><Icon name="LogOut" size={20} /></button>
+                            </div>
+                        </div>
+                    </header>
 
-              <div className="mt-8">
-                 <button onClick={() => setView('lobby')} className="text-gray-400 hover:text-gray-600 text-sm">Quitter la partie</button>
-              </div>
-           </div>
-        )}
+                    <main className="max-w-6xl mx-auto px-4">
+                        {/* LOBBY */}
+                        {view === 'lobby' && (
+                            <div className="space-y-6">
+                                <div className="flex justify-between items-center">
+                                    <h2 className="text-3xl font-bold dark:text-white">Mes Decks</h2>
+                                    <Button onClick={createDeck}><Icon name="Plus" size={18} /> Créer</Button>
+                                </div>
+                                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                                    {loading ? <p>Chargement...</p> : decks.map(deck => (
+                                        <CardContainer key={deck.id} className="group relative overflow-hidden cursor-pointer hover:-translate-y-1 transition-transform">
+                                            <div className="absolute top-0 left-0 w-2 h-full bg-[var(--primary)]"></div>
+                                            <div className="p-6">
+                                                <div className="flex justify-between mb-4">
+                                                    <h3 className="text-xl font-bold truncate dark:text-white">{deck.title}</h3>
+                                                    <div className="flex gap-1">
+                                                        <button onClick={(e) => { e.stopPropagation(); setCurrentDeck(deck); setView('editor'); }} className="p-2 text-gray-400 hover:text-[var(--primary)]"><Icon name="Edit2" size={16}/></button>
+                                                        <button onClick={(e) => { e.stopPropagation(); deleteDeck(deck.id); }} className="p-2 text-gray-400 hover:text-red-500"><Icon name="Trash2" size={16}/></button>
+                                                    </div>
+                                                </div>
+                                                <div className="flex justify-between items-end mt-4">
+                                                    <div className="text-sm text-gray-500"><Icon name="Folder" size={14} className="inline mr-1"/> {deck.rootCategory.subCategories?.length || 0} Cats</div>
+                                                    <Button onClick={() => startGame(deck)} className="rounded-full shadow-md"><Icon name="Play" size={18} /> Jouer</Button>
+                                                </div>
+                                            </div>
+                                        </CardContainer>
+                                    ))}
+                                    {decks.length === 0 && !loading && (
+                                        <div className="col-span-full py-20 text-center border-2 border-dashed border-gray-300 rounded-xl dark:border-gray-700">
+                                            <p className="text-gray-500">Aucun deck. Créez-en un !</p>
+                                        </div>
+                                    )}
+                                </div>
+                            </div>
+                        )}
 
-      </main>
-    </div>
-  );
-}
+                        {/* EDITOR */}
+                        {view === 'editor' && currentDeck && (
+                            <div className="animate-fade-in">
+                                <div className="flex items-center gap-4 mb-6">
+                                    <button onClick={() => { saveDeck(currentDeck); setView('lobby'); }} className="p-2 hover:bg-gray-200 dark:hover:bg-gray-800 rounded-full dark:text-white"><Icon name="ArrowLeft" /></button>
+                                    <input 
+                                        value={currentDeck.title} 
+                                        onChange={(e) => setCurrentDeck({...currentDeck, title: e.target.value})}
+                                        className="text-3xl font-bold bg-transparent border-none outline-none w-full dark:text-white"
+                                    />
+                                    <Button onClick={() => saveDeck(currentDeck)} variant="success"><Icon name="Save" size={18} /> Sauver</Button>
+                                </div>
+                                <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+                                    <div className="lg:col-span-1 bg-white dark:bg-gray-800 p-6 rounded-xl shadow-sm">
+                                        <CategoryTree 
+                                            category={currentDeck.rootCategory}
+                                            onAddSub={(parentId) => {
+                                                const name = prompt("Nom ?");
+                                                if(!name) return;
+                                                const newCat = { id: generateId(), name, subCategories: [], cards: [] };
+                                                const newRoot = updateCategoryInTree({...currentDeck.rootCategory}, parentId, (cat) => ({ ...cat, subCategories: [...(cat.subCategories||[]), newCat] }));
+                                                setCurrentDeck({...currentDeck, rootCategory: newRoot});
+                                            }}
+                                            onAddCard={(catId) => {
+                                                const q = prompt("Question ?");
+                                                const a = prompt("Réponse ?");
+                                                if(!q || !a) return;
+                                                const newCard = { id: generateId(), question: q, answer: a, difficulty: 3, priority: 'normal', createdAt: Date.now() };
+                                                const newRoot = updateCategoryInTree({...currentDeck.rootCategory}, catId, (cat) => ({ ...cat, cards: [...(cat.cards||[]), newCard] }));
+                                                setCurrentDeck({...currentDeck, rootCategory: newRoot});
+                                            }}
+                                            onEdit={(item, card) => {
+                                                if(card) alert("Pour modifier rapidement: Supprimez et recréez (Demo)"); 
+                                                else {
+                                                    const name = prompt("Renommer", item.name);
+                                                    if(name) {
+                                                        const newRoot = updateCategoryInTree({...currentDeck.rootCategory}, item.id, (cat) => ({...cat, name}));
+                                                        setCurrentDeck({...currentDeck, rootCategory: newRoot});
+                                                    }
+                                                }
+                                            }}
+                                            onDelete={(parentId, cardId) => {
+                                                if(!confirm("Supprimer ?")) return;
+                                                const newRoot = deleteFromTree({...currentDeck.rootCategory}, cardId || parentId, cardId ? 'card' : 'category');
+                                                setCurrentDeck({...currentDeck, rootCategory: newRoot});
+                                            }}
+                                        />
+                                    </div>
+                                    <div className="lg:col-span-2 flex flex-col items-center justify-center text-center text-gray-500 bg-gray-50 dark:bg-gray-800/50 p-10 rounded-xl border-dashed border-2 border-gray-200 dark:border-gray-700">
+                                        <Icon name="Brain" size={64} className="text-gray-300 mb-4" />
+                                        <p>Utilisez l'arbre à gauche pour construire votre deck.</p>
+                                    </div>
+                                </div>
+                            </div>
+                        )}
+
+                        {/* GAME */}
+                        {view === 'game' && currentCard && (
+                            <div className="max-w-2xl mx-auto flex flex-col items-center min-h-[60vh] justify-center">
+                                <div className="w-full flex justify-between items-center mb-8 text-gray-500">
+                                    <span className="font-bold text-[var(--primary)] text-xl">Score: {sessionScore}</span>
+                                    <span className="text-sm">{gameQueue.length} cartes restantes</span>
+                                </div>
+
+                                <div className="relative w-full aspect-[3/2] perspective-1000 group cursor-pointer" onClick={() => !isFlipped && setIsFlipped(true)}>
+                                    <div className={`relative w-full h-full transition-all duration-500 transform preserve-3d ${isFlipped ? 'rotate-y-180' : ''}`}>
+                                        <div className="absolute inset-0 backface-hidden bg-white dark:bg-gray-800 rounded-3xl shadow-2xl border-b-8 border-gray-200 dark:border-gray-700 flex flex-col items-center justify-center p-8 text-center">
+                                            <span className="absolute top-6 left-6 text-xs font-bold uppercase tracking-widest text-gray-400">{currentCard.categoryName}</span>
+                                            <h2 className="text-3xl font-bold dark:text-white">{currentCard.question}</h2>
+                                            <p className="mt-8 text-gray-400 text-sm animate-bounce">Cliquez pour retourner</p>
+                                        </div>
+                                        <div className="absolute inset-0 backface-hidden bg-[var(--primary)] rotate-y-180 rounded-3xl shadow-2xl flex flex-col items-center justify-center p-8 text-center text-white">
+                                            <h2 className="text-3xl font-medium">{currentCard.answer}</h2>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <div className={`mt-12 w-full grid grid-cols-2 gap-6 transition-opacity duration-300 ${isFlipped ? 'opacity-100 pointer-events-auto' : 'opacity-0 pointer-events-none'}`}>
+                                    <button onClick={() => handleAnswer(false)} className="py-4 rounded-xl bg-red-500 text-white font-bold shadow-lg hover:bg-red-600 transition-all">Je ne sais pas (-5)</button>
+                                    <button onClick={() => handleAnswer(true)} className="py-4 rounded-xl bg-green-500 text-white font-bold shadow-lg hover:bg-green-600 transition-all">Je sais ! (+10)</button>
+                                </div>
+                                <button onClick={() => setView('lobby')} className="mt-8 text-gray-400 hover:text-gray-600">Quitter</button>
+                            </div>
+                        )}
+                    </main>
+                </div>
+            );
+        }
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<MemoDeckApp />);
+    </script>
+</body>
+</html>
